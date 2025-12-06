@@ -1,1 +1,2093 @@
-{"metadata":{"kernelspec":{"language":"python","display_name":"Python 3","name":"python3"},"language_info":{"name":"python","version":"3.11.13","mimetype":"text/x-python","codemirror_mode":{"name":"ipython","version":3},"pygments_lexer":"ipython3","nbconvert_exporter":"python","file_extension":".py"},"kaggle":{"accelerator":"nvidiaTeslaT4","dataSources":[{"sourceId":91723,"databundleVersionId":14272474,"sourceType":"competition"},{"sourceId":13128284,"sourceType":"datasetVersion","datasetId":8316713}],"dockerImageVersionId":31193,"isInternetEnabled":true,"language":"python","sourceType":"notebook","isGpuEnabled":true}},"nbformat_minor":4,"nbformat":4,"cells":[{"cell_type":"markdown","source":"# 1. Import libraries","metadata":{}},{"cell_type":"code","source":"from cuml.preprocessing import TargetEncoder\nfrom itertools import combinations\nfrom lightgbm import LGBMClassifier\nimport numpy as np\nimport os\nimport optuna\nimport pickle\nimport pandas as pd\nfrom sklearn.model_selection import RepeatedStratifiedKFold\nfrom sklearn.metrics import roc_auc_score\nfrom typing import Callable, Optional\nimport xgboost as xgb\n","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2025-12-05T22:30:39.261270Z","iopub.execute_input":"2025-12-05T22:30:39.261595Z","iopub.status.idle":"2025-12-05T22:30:50.473317Z","shell.execute_reply.started":"2025-12-05T22:30:39.261571Z","shell.execute_reply":"2025-12-05T22:30:50.472660Z"}},"outputs":[],"execution_count":1},{"cell_type":"markdown","source":"# 2. Configuration","metadata":{}},{"cell_type":"code","source":"SEED = 2025\n\nclass CFG:\n    train_csv = '/kaggle/input/playground-series-s5e12/train.csv'\n    test_csv = '/kaggle/input/playground-series-s5e12/test.csv'\n    orig_csv = '/kaggle/input/diabetes-health-indicators-dataset/diabetes_dataset.csv'\n    sample_submission_csv = '/kaggle/input/playground-series-s5e12/sample_submission.csv'\n    target = 'diagnosed_diabetes'\n    output = 'submission/%s.csv'\n    ag_presets = 'best_quality'\n    ag_time_limit = 4*3600\n\n    kfold_n_splits = 5\n    kfold_n_repeats = 2\n    kfold_random_state = SEED\n\n    optuna = False\n\n    merge_original_dataset = False\n\n    xgb_params7_optuna = {\n        'objective': 'binary:logistic',\n        'eval_metric': 'auc',\n        'learning_rate': 0.008559367757686604,\n        'max_depth': 5,\n        'subsample': 0.93,\n        'colsample_bytree': 0.19,\n        'seed': 2025,\n        'device': 'cuda',\n        'grow_policy': 'lossguide',\n        'alpha': 2.0,\n        'lambda': 0.73,\n        'min_child_weight': 5,\n        'min_samples_split': 5,\n        'max_bin': 512,\n        'n_estimators': 20000,\n        'early_stopping_rounds': 300\n    }\n\n    lgb_params7_optuna = {\n        'random_state': SEED,\n        'verbose': -1,\n        'n_estimators': 10_000,\n        'metric': 'AUC',\n        'objective': 'binary',\n        'learning_rate': 0.0002975707557336301,\n        'max_depth': 6,\n        'min_child_samples': 14,\n        'subsample': 0.88,\n        'colsample_bytree': 0.72,\n        'num_leaves': 575,\n        'reg_alpha': 0.79,\n        'reg_lambda': 9.96,\n        'max_bin': 157,\n    }","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2025-12-05T22:31:35.907801Z","iopub.execute_input":"2025-12-05T22:31:35.908327Z","iopub.status.idle":"2025-12-05T22:31:35.914658Z","shell.execute_reply.started":"2025-12-05T22:31:35.908303Z","shell.execute_reply":"2025-12-05T22:31:35.913956Z"}},"outputs":[],"execution_count":2},{"cell_type":"markdown","source":"# 3. Helper classes and functions","metadata":{}},{"cell_type":"markdown","source":"## 3.1. For CV","metadata":{}},{"cell_type":"code","source":"class CV:\n    def __init__(self,\n                 k_fold_strategy,\n                 df_train: pd.DataFrame,\n                 target: str,\n                 proba: bool=False,\n                 fold_transform_train: Optional[Callable]=None,\n                 fold_transform_test: Optional[Callable]=None\n                 ) -> None:\n        self.k_fold_strategy = k_fold_strategy\n        self.df = df_train\n        self.y = df_train[target]\n        self.target = target\n        self.proba = proba\n        self.fold_transform_train = fold_transform_train if fold_transform_train else lambda inp, model:inp\n        self.fold_transform_test = fold_transform_test if fold_transform_test else lambda inp, model:inp\n\n\n    def fit(self, get_model: Callable, provide_val_data: bool=False) -> tuple[list, np.ndarray]:\n        self.models = []\n        oof_preds = np.zeros_like(self.y)\n        for fold, (train_index, test_index) in enumerate(self.k_fold_strategy.split(self.y, self.y)):\n            print(\"#\" * 25)\n            print(f\"### Fold {fold + 1} ###\")\n            print(\"#\" * 25)\n\n            model = get_model()\n\n            x_train = self.fold_transform_train(self.df.iloc[train_index].copy(), model)\n            y_train = x_train.pop(self.target)\n\n            x_test = self.fold_transform_test(self.df.iloc[test_index].copy(), model)\n            y_test = x_test.pop(self.target)\n\n            if provide_val_data:\n                model.fit(x_train, y_train, x_test, y_test)\n            else:\n                model.fit(x_train, y_train)\n\n            if self.proba:\n                proba = model.predict_proba(x_test)\n                if hasattr(proba, 'to_numpy'):\n                    proba = proba.to_numpy()\n                oof_preds[test_index] += proba[:, 1]\n            else:\n                oof_preds[test_index] += model.predict(x_test)\n            self.models.append(model)\n        return self.models, oof_preds\n\n\n    def predict(self, df_test: pd.DataFrame) -> np.ndarray:\n        if self.target in df_test.columns:\n            df_test = df_test.drop(self.target, axis=1)\n        preds = 0\n        for model in self.models:\n            df_test_transformed = self.fold_transform_test(df_test.copy(), model)\n            if self.proba:\n                proba = model.predict_proba(df_test_transformed)\n                if hasattr(proba, 'to_numpy'):\n                    proba = proba.to_numpy()\n                preds += proba[:, 1]\n            else:\n                preds += model.predict(df_test_transformed)\n        return preds / len(self.models)","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2025-12-05T22:31:42.552450Z","iopub.execute_input":"2025-12-05T22:31:42.552857Z","iopub.status.idle":"2025-12-05T22:31:42.563236Z","shell.execute_reply.started":"2025-12-05T22:31:42.552833Z","shell.execute_reply":"2025-12-05T22:31:42.562326Z"}},"outputs":[],"execution_count":3},{"cell_type":"markdown","source":"## 3.2. For FE","metadata":{}},{"cell_type":"code","source":"class FeatureEngineer:\n    def __init__(self, df: pd.DataFrame, target: str) -> None:\n        self.df = df\n        self.target = target\n\n    def columns_x_info(self) -> tuple[list, list]:\n        \"\"\"\n        Print the dataframe columns info and split columns by their type\n        Target columns is skipped, so only X columns are analysed\n        \"\"\"\n        categoric = []\n        numeric = []\n        for col in self.df.columns:\n            if col in [self.target, '_dataset']:\n                continue\n\n            if self.df[col].dtype == 'object':\n                categoric.append(col)\n                tp = 'CAT'\n            else:\n                numeric.append(col)\n                tp = 'NUM'\n            num_values = self.df[col].nunique()\n            nans = self.df[col].isna().sum()\n            print(f\"[{tp}] {col} has {num_values} unique values and {nans} NANs\")\n        print(\"Categoric:\", categoric )\n        print(\"Numeric:\", numeric )\n        return categoric, numeric\n\n    def label_encoder_categoric(self, categoric: list[str]) -> None:\n        \"\"\"\n        Inplace transform all categoric columns to the columns with integer-only values\n        \"\"\"\n        for col in categoric:\n            self.df[col] = self.df[col].factorize()[0].astype('int32')\n\n    def label_encoder_numeric(self, numeric: list[str], suffix: str = '_cat') -> list[str]:\n        \"\"\"\n        Inplace duplicate numeric columns transforming them to categorical ones\n        \"\"\"\n        new_cols = []\n        for col in numeric:\n            self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n            new_cols.append(col + suffix)\n        return new_cols\n\n    def create_categoric_pairs(self, categoric: list[str], inplace: bool=True) -> pd.DataFrame:\n        \"\"\"\n        Combine previously label-encoded categorical columns into one new dataframe\n        \"\"\"\n        pairs = list(combinations(categoric, 2))\n        return self.create_pairs(pairs, inplace)\n\n    def create_pairs(self, pairs: list[tuple[str,str]], inplace: bool=True, to_str: bool=False) -> pd.DataFrame:\n        \"\"\"\n        Combine pairs of categorical columns\n        \"\"\"\n        combined_df = {}\n        for col1, col2 in pairs:\n            combined = \"_\".join(sorted((col1, col2)))\n            if to_str:\n                combined_df[combined] = self.df[col1].astype(str) + '_' + self.df[col2].astype(str)\n            else:\n                combined_df[combined] = self.df[col1] * (1 + max(self.df[col2])) + self.df[col2]\n        combined_df = pd.DataFrame(combined_df)\n\n        if inplace:\n            self.df = pd.concat([self.df, combined_df], axis=1)\n\n        return combined_df\n\n    def count_encoder_categoric(self, categoric: list[str], suffix: str='_cnt') -> list[str]:\n        \"\"\"\n        Inplace addition of count-encoded categorical columns\n        \"\"\"\n        new_cols = []\n        for col in categoric:\n            col_cnt = self.df.groupby(col)[self.target].count().astype('int32')\n            col_cnt.name = col + suffix\n            new_cols.append(col_cnt.name)\n            self.df = self.df.merge(col_cnt, on=col, how='left')\n        return new_cols\n\n    def target_encoder_categoric(self, categoric: list[str], dataset: pd.DataFrame, suffix: str='_trg') -> list[str]:\n        \"\"\"\n        Inplace addition of target-encoded categorical columns using the specified dataset for calculations\n        \"\"\"\n        new_cols = []\n        for col in categoric:\n            col_trg = dataset.groupby(col)[self.target].mean()\n            col_trg.name = col + suffix\n            new_cols.append(col_trg.name)\n            self.df = self.df.merge(col_trg, on=col, how='left')\n        return new_cols\n        \n    def add_bin_features(self, numeric: list[str], q: int=5, suffix: str='_bin'):\n        \"\"\"\n        Inplace addition of bins for the specified numeric features, thus transforming them to categoric\n        \"\"\"\n        new_cols = []\n        for col in numeric:\n            self.df[col + suffix], _ = pd.qcut(self.df[col], q=q, labels=False, retbins=True, duplicates=\"drop\")\n            new_cols.append(col + suffix)\n        return new_cols\n\n    def add_digit_features(self, numeric: list[str], suffix: str='_dig'):\n        \"\"\"\n        Inplace addition of digit features\n        \"\"\"\n        new_cols = []\n        for col in numeric:\n            sp = self.df[col].astype(str).str.split('.', expand=True).fillna('')\n            b = max(sp[0].astype(str).str.len())\n            a = max(sp[1].astype(str).str.len()) if 1 in sp.columns else 0\n\n            for k in range(1 - b, a + 1):\n                new_col = f'{col}{suffix}{k}'\n                self.df[new_col] = ((self.df[col] * 10**k) % 10).fillna(-1).astype(\"int8\")\n                new_cols.append(new_col)\n        return new_cols\n\n    def add_round_features(self, numeric: list[str], round: list=[-1, 0], suffix: str='_round'):\n        \"\"\"\n        Inplace addition of rounded features\n        \"\"\"\n        new_cols = []\n        for col in numeric:\n            for r in round:\n                new_col = f'{col}{suffix}{r}'\n                self.df[new_col] = self.df[col].round(r)\n                new_cols.append(new_col)\n        return new_cols\n\n    def astype(self, columns, to_type):\n        \"\"\"\n        Transform the columns' type\n        \"\"\"\n        self.df[columns] = self.df[columns].astype(to_type)","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2025-12-05T22:32:13.104231Z","iopub.execute_input":"2025-12-05T22:32:13.104855Z","iopub.status.idle":"2025-12-05T22:32:13.121897Z","shell.execute_reply.started":"2025-12-05T22:32:13.104828Z","shell.execute_reply":"2025-12-05T22:32:13.121233Z"}},"outputs":[],"execution_count":4},{"cell_type":"markdown","source":"## 3.3. Wrapper classes","metadata":{}},{"cell_type":"code","source":"class XGBWrapper:\n    def __init__(self, xgb_params: dict) -> None:\n        self.model = xgb.XGBClassifier(**xgb_params)\n\n    def fit(self, x, y, val_x, val_y):\n        self.model.fit(x, y, eval_set=[(val_x, val_y)], verbose=300)\n\n    def predict_proba(self, x):\n        return self.model.predict_proba(x, iteration_range=(0, self.model.best_iteration + 1))\n\n\nclass LGBWrapper:\n    def __init__(self, lgb_params: dict) -> None:\n        self.model = LGBMClassifier(**lgb_params)\n\n    def fit(self, x, y, val_x, val_y):\n        self.model.fit(x, y, eval_set=[(val_x, val_y)])\n\n    def predict_proba(self, x):\n        return self.model.predict_proba(x)\n","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2025-12-05T22:32:18.282082Z","iopub.execute_input":"2025-12-05T22:32:18.282387Z","iopub.status.idle":"2025-12-05T22:32:18.288175Z","shell.execute_reply.started":"2025-12-05T22:32:18.282364Z","shell.execute_reply":"2025-12-05T22:32:18.287429Z"}},"outputs":[],"execution_count":5},{"cell_type":"markdown","source":"## 3.4. Dataset load/combine/split","metadata":{}},{"cell_type":"code","source":"def load_combined_dataset(*datasets_csv, target: str) -> pd.DataFrame:\n    dfs = []\n    columns = None\n\n    for n, csv in enumerate(datasets_csv):\n        df = pd.read_csv(csv)\n        if 'id' in df.columns:\n            df = df.drop(columns='id')\n        df['_dataset'] = n\n\n        if columns is None:\n            columns = set(df.columns)\n        else:\n            columns &= set(df.columns)\n\n        dfs.append(df)\n\n    for df in dfs:\n        df.drop(list(set(df.columns) - columns - {target}), axis=1, inplace=True)\n\n    return pd.concat(dfs, axis=0)\n\n\ndef split_combined_dataset(df: pd.DataFrame) -> list[pd.DataFrame]:\n    return [df[df['_dataset'] == n].drop('_dataset', axis=1) for n in sorted(df['_dataset'].unique())]","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2025-12-05T22:32:31.478469Z","iopub.execute_input":"2025-12-05T22:32:31.478801Z","iopub.status.idle":"2025-12-05T22:32:31.485589Z","shell.execute_reply.started":"2025-12-05T22:32:31.478777Z","shell.execute_reply":"2025-12-05T22:32:31.484661Z"}},"outputs":[],"execution_count":6},{"cell_type":"markdown","source":"# 4. Training","metadata":{}},{"cell_type":"markdown","source":"## 4.1. Adversarial validation\nHere, we want to determine whether the train and original datasets differ or are they nearly identical. To do this, we state the problem of identifying the dataset. We use the same XGB classifier and ROCAUC metrics.","metadata":{}},{"cell_type":"code","source":"# Load the data\ndf = load_combined_dataset(CFG.train_csv, CFG.test_csv, CFG.orig_csv, target=CFG.target)\nfe = FeatureEngineer(df, CFG.target)                                # Without FE: error\ncategoric, numeric = fe.columns_x_info()\nfe.astype(numeric, 'int32')\nfe.label_encoder_categoric(categoric)                               #\n\ndf_train, df_test, df_orig = split_combined_dataset(fe.df)","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2025-12-05T22:32:48.848719Z","iopub.execute_input":"2025-12-05T22:32:48.849011Z","iopub.status.idle":"2025-12-05T22:32:53.730651Z","shell.execute_reply.started":"2025-12-05T22:32:48.848989Z","shell.execute_reply":"2025-12-05T22:32:53.729991Z"}},"outputs":[{"name":"stdout","text":"[NUM] age has 73 unique values and 0 NANs\n[NUM] alcohol_consumption_per_week has 11 unique values and 0 NANs\n[NUM] physical_activity_minutes_per_week has 622 unique values and 0 NANs\n[NUM] diet_score has 101 unique values and 0 NANs\n[NUM] sleep_hours_per_day has 71 unique values and 0 NANs\n[NUM] screen_time_hours_per_day has 156 unique values and 0 NANs\n[NUM] bmi has 241 unique values and 0 NANs\n[NUM] waist_to_hip_ratio has 40 unique values and 0 NANs\n[NUM] systolic_bp has 86 unique values and 0 NANs\n[NUM] diastolic_bp has 60 unique values and 0 NANs\n[NUM] heart_rate has 64 unique values and 0 NANs\n[NUM] cholesterol_total has 210 unique values and 0 NANs\n[NUM] hdl_cholesterol has 79 unique values and 0 NANs\n[NUM] ldl_cholesterol has 190 unique values and 0 NANs\n[NUM] triglycerides has 262 unique values and 0 NANs\n[CAT] gender has 3 unique values and 0 NANs\n[CAT] ethnicity has 5 unique values and 0 NANs\n[CAT] education_level has 4 unique values and 0 NANs\n[CAT] income_level has 5 unique values and 0 NANs\n[CAT] smoking_status has 3 unique values and 0 NANs\n[CAT] employment_status has 4 unique values and 0 NANs\n[NUM] family_history_diabetes has 2 unique values and 0 NANs\n[NUM] hypertension_history has 2 unique values and 0 NANs\n[NUM] cardiovascular_history has 2 unique values and 0 NANs\nCategoric: ['gender', 'ethnicity', 'education_level', 'income_level', 'smoking_status', 'employment_status']\nNumeric: ['age', 'alcohol_consumption_per_week', 'physical_activity_minutes_per_week', 'diet_score', 'sleep_hours_per_day', 'screen_time_hours_per_day', 'bmi', 'waist_to_hip_ratio', 'systolic_bp', 'diastolic_bp', 'heart_rate', 'cholesterol_total', 'hdl_cholesterol', 'ldl_cholesterol', 'triglycerides', 'family_history_diabetes', 'hypertension_history', 'cardiovascular_history']\n","output_type":"stream"}],"execution_count":7},{"cell_type":"code","source":"def adversarial_validation(df1, df2):\n    # Below, we use simplified settings for speed since we are just testing the datasets here\n    target = '_dataset'\n    xgb_params = CFG.xgb_params7_optuna.copy()\n    xgb_params['n_estimators'] = 1000\n    k_fold_strategy = RepeatedStratifiedKFold(n_splits=2, n_repeats=1, random_state=CFG.kfold_random_state)\n    \n    df1 = df1.drop(CFG.target, axis=1)\n    df2 = df2.drop(CFG.target, axis=1)    \n    df1[target] = 1.0\n    df2[target] = 0.0\n    df = pd.concat((df1, df2))\n    cv = CV(k_fold_strategy,\n            df,\n            target=target,\n            proba=True)\n    _, oof_preds = cv.fit(get_model=lambda: XGBWrapper(xgb_params), provide_val_data=True)\n    return roc_auc_score(df[target], oof_preds)\n    \noof_score_train_test = adversarial_validation(df_train, df_test)\noof_score_train_orig = adversarial_validation(df_train, df_orig)\noof_score_test_orig = adversarial_validation(df_test, df_orig)\n\nprint('\\n' + '#' * 40)\n\nprint(f'TRAIN <--> TEST oof score = {oof_score_train_test}')\nprint(f'TRAIN <--> ORIG oof score = {oof_score_train_orig}')\nprint(f'TEST <--> ORIG oof score = {oof_score_test_orig}')","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2025-12-05T22:33:22.385511Z","iopub.execute_input":"2025-12-05T22:33:22.386233Z","iopub.status.idle":"2025-12-05T22:34:09.479561Z","shell.execute_reply.started":"2025-12-05T22:33:22.386197Z","shell.execute_reply":"2025-12-05T22:34:09.478592Z"}},"outputs":[{"name":"stdout","text":"#########################\n### Fold 1 ###\n#########################\n","output_type":"stream"},{"name":"stderr","text":"/usr/local/lib/python3.11/dist-packages/xgboost/core.py:160: UserWarning: [22:33:24] WARNING: /workspace/src/learner.cc:742: \nParameters: { \"min_samples_split\" } are not used.\n\n  warnings.warn(smsg, UserWarning)\n","output_type":"stream"},{"name":"stdout","text":"[0]\tvalidation_0-auc:0.54840\n[300]\tvalidation_0-auc:0.61487\n[600]\tvalidation_0-auc:0.61703\n[900]\tvalidation_0-auc:0.61869\n[999]\tvalidation_0-auc:0.61927\n","output_type":"stream"},{"name":"stderr","text":"/usr/local/lib/python3.11/dist-packages/xgboost/core.py:160: UserWarning: [22:33:32] WARNING: /workspace/src/common/error_msg.cc:58: Falling back to prediction using DMatrix due to mismatched devices. This might lead to higher memory usage and slower performance. XGBoost is running on: cuda:0, while the input data is on: cpu.\nPotential solutions:\n- Use a data structure that matches the device ordinal in the booster.\n- Set the device for booster before call to inplace_predict.\n\nThis warning will only be shown once.\n\n  warnings.warn(smsg, UserWarning)\n","output_type":"stream"},{"name":"stdout","text":"#########################\n### Fold 2 ###\n#########################\n[0]\tvalidation_0-auc:0.54893\n","output_type":"stream"},{"name":"stderr","text":"/usr/local/lib/python3.11/dist-packages/xgboost/core.py:160: UserWarning: [22:33:33] WARNING: /workspace/src/learner.cc:742: \nParameters: { \"min_samples_split\" } are not used.\n\n  warnings.warn(smsg, UserWarning)\n","output_type":"stream"},{"name":"stdout","text":"[300]\tvalidation_0-auc:0.61591\n[600]\tvalidation_0-auc:0.61766\n[900]\tvalidation_0-auc:0.61924\n[999]\tvalidation_0-auc:0.61983\n#########################\n### Fold 1 ###\n#########################\n[0]\tvalidation_0-auc:0.63421\n","output_type":"stream"},{"name":"stderr","text":"/usr/local/lib/python3.11/dist-packages/xgboost/core.py:160: UserWarning: [22:33:43] WARNING: /workspace/src/learner.cc:742: \nParameters: { \"min_samples_split\" } are not used.\n\n  warnings.warn(smsg, UserWarning)\n","output_type":"stream"},{"name":"stdout","text":"[300]\tvalidation_0-auc:0.90261\n[600]\tvalidation_0-auc:0.90733\n[900]\tvalidation_0-auc:0.91070\n[999]\tvalidation_0-auc:0.91151\n#########################\n### Fold 2 ###\n#########################\n[0]\tvalidation_0-auc:0.63807\n","output_type":"stream"},{"name":"stderr","text":"/usr/local/lib/python3.11/dist-packages/xgboost/core.py:160: UserWarning: [22:33:51] WARNING: /workspace/src/learner.cc:742: \nParameters: { \"min_samples_split\" } are not used.\n\n  warnings.warn(smsg, UserWarning)\n","output_type":"stream"},{"name":"stdout","text":"[300]\tvalidation_0-auc:0.90187\n[600]\tvalidation_0-auc:0.90657\n[900]\tvalidation_0-auc:0.90996\n[999]\tvalidation_0-auc:0.91086\n#########################\n### Fold 1 ###\n#########################\n[0]\tvalidation_0-auc:0.65287\n","output_type":"stream"},{"name":"stderr","text":"/usr/local/lib/python3.11/dist-packages/xgboost/core.py:160: UserWarning: [22:33:59] WARNING: /workspace/src/learner.cc:742: \nParameters: { \"min_samples_split\" } are not used.\n\n  warnings.warn(smsg, UserWarning)\n","output_type":"stream"},{"name":"stdout","text":"[300]\tvalidation_0-auc:0.86017\n[600]\tvalidation_0-auc:0.86548\n[900]\tvalidation_0-auc:0.86934\n[999]\tvalidation_0-auc:0.87029\n#########################\n### Fold 2 ###\n#########################\n[0]\tvalidation_0-auc:0.66526\n","output_type":"stream"},{"name":"stderr","text":"/usr/local/lib/python3.11/dist-packages/xgboost/core.py:160: UserWarning: [22:34:04] WARNING: /workspace/src/learner.cc:742: \nParameters: { \"min_samples_split\" } are not used.\n\n  warnings.warn(smsg, UserWarning)\n","output_type":"stream"},{"name":"stdout","text":"[300]\tvalidation_0-auc:0.85929\n[600]\tvalidation_0-auc:0.86497\n[900]\tvalidation_0-auc:0.86891\n[999]\tvalidation_0-auc:0.86984\n\n########################################\nTRAIN <--> TEST oof score = 0.6195482986928571\nTRAIN <--> ORIG oof score = 0.9111857960214286\nTEST <--> ORIG oof score = 0.8700643765666667\n","output_type":"stream"}],"execution_count":8},{"cell_type":"markdown","source":"#### So, while TRAIN and TEST datasets have quite significant differencies, ORIGINAL dataset is completely different!\n\nThe idea of vertical merging this dataset may be useless, so `CFG.merge_original_dataset` is set to `False`","metadata":{}},{"cell_type":"markdown","source":"## 4.2. Prepare the dataset","metadata":{}},{"cell_type":"code","source":"cat1, cat2 = [], []\n\n# Load the data\ndf = load_combined_dataset(CFG.train_csv, CFG.test_csv, CFG.orig_csv, target=CFG.target)\n\n# Now do different processing\nfe = FeatureEngineer(df, CFG.target)                                # Without FE: error\n\ncategoric, numeric = fe.columns_x_info()\n\ncategoric += fe.add_bin_features(numeric)\ncategoric += fe.add_digit_features(numeric)\nfe.add_round_features(numeric)\n\nfe.label_encoder_categoric(categoric)                               #\n\ncat1 = fe.label_encoder_numeric(numeric)                            #\nfe.astype(numeric, 'int32')\ncategoric += cat1\n\n#combined_df = fe.create_categoric_pairs(categoric, inplace=True)    # Uncomment for experimenting\n#cat2 = list(combined_df.columns)\n#categoric += cat2\n\nfe.count_encoder_categoric(categoric)                               #\ndf_train, df_test, df_orig = split_combined_dataset(fe.df)","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2025-12-05T22:46:38.448161Z","iopub.execute_input":"2025-12-05T22:46:38.448985Z","iopub.status.idle":"2025-12-05T22:48:50.070450Z","shell.execute_reply.started":"2025-12-05T22:46:38.448939Z","shell.execute_reply":"2025-12-05T22:48:50.069735Z"}},"outputs":[{"name":"stdout","text":"[NUM] age has 73 unique values and 0 NANs\n[NUM] alcohol_consumption_per_week has 11 unique values and 0 NANs\n[NUM] physical_activity_minutes_per_week has 622 unique values and 0 NANs\n[NUM] diet_score has 101 unique values and 0 NANs\n[NUM] sleep_hours_per_day has 71 unique values and 0 NANs\n[NUM] screen_time_hours_per_day has 156 unique values and 0 NANs\n[NUM] bmi has 241 unique values and 0 NANs\n[NUM] waist_to_hip_ratio has 40 unique values and 0 NANs\n[NUM] systolic_bp has 86 unique values and 0 NANs\n[NUM] diastolic_bp has 60 unique values and 0 NANs\n[NUM] heart_rate has 64 unique values and 0 NANs\n[NUM] cholesterol_total has 210 unique values and 0 NANs\n[NUM] hdl_cholesterol has 79 unique values and 0 NANs\n[NUM] ldl_cholesterol has 190 unique values and 0 NANs\n[NUM] triglycerides has 262 unique values and 0 NANs\n[CAT] gender has 3 unique values and 0 NANs\n[CAT] ethnicity has 5 unique values and 0 NANs\n[CAT] education_level has 4 unique values and 0 NANs\n[CAT] income_level has 5 unique values and 0 NANs\n[CAT] smoking_status has 3 unique values and 0 NANs\n[CAT] employment_status has 4 unique values and 0 NANs\n[NUM] family_history_diabetes has 2 unique values and 0 NANs\n[NUM] hypertension_history has 2 unique values and 0 NANs\n[NUM] cardiovascular_history has 2 unique values and 0 NANs\nCategoric: ['gender', 'ethnicity', 'education_level', 'income_level', 'smoking_status', 'employment_status']\nNumeric: ['age', 'alcohol_consumption_per_week', 'physical_activity_minutes_per_week', 'diet_score', 'sleep_hours_per_day', 'screen_time_hours_per_day', 'bmi', 'waist_to_hip_ratio', 'systolic_bp', 'diastolic_bp', 'heart_rate', 'cholesterol_total', 'hdl_cholesterol', 'ldl_cholesterol', 'triglycerides', 'family_history_diabetes', 'hypertension_history', 'cardiovascular_history']\n","output_type":"stream"},{"name":"stderr","text":"/tmp/ipykernel_47/3356540199.py:130: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n  self.df[new_col] = self.df[col].round(r)\n/tmp/ipykernel_47/3356540199.py:130: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n  self.df[new_col] = self.df[col].round(r)\n/tmp/ipykernel_47/3356540199.py:130: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n  self.df[new_col] = self.df[col].round(r)\n/tmp/ipykernel_47/3356540199.py:130: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n  self.df[new_col] = self.df[col].round(r)\n/tmp/ipykernel_47/3356540199.py:130: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n  self.df[new_col] = self.df[col].round(r)\n/tmp/ipykernel_47/3356540199.py:130: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n  self.df[new_col] = self.df[col].round(r)\n/tmp/ipykernel_47/3356540199.py:130: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n  self.df[new_col] = self.df[col].round(r)\n/tmp/ipykernel_47/3356540199.py:130: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n  self.df[new_col] = self.df[col].round(r)\n/tmp/ipykernel_47/3356540199.py:130: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n  self.df[new_col] = self.df[col].round(r)\n/tmp/ipykernel_47/3356540199.py:130: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n  self.df[new_col] = self.df[col].round(r)\n/tmp/ipykernel_47/3356540199.py:130: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n  self.df[new_col] = self.df[col].round(r)\n/tmp/ipykernel_47/3356540199.py:130: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n  self.df[new_col] = self.df[col].round(r)\n/tmp/ipykernel_47/3356540199.py:130: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n  self.df[new_col] = self.df[col].round(r)\n/tmp/ipykernel_47/3356540199.py:130: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n  self.df[new_col] = self.df[col].round(r)\n/tmp/ipykernel_47/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n/tmp/ipykernel_47/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n/tmp/ipykernel_47/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n/tmp/ipykernel_47/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n/tmp/ipykernel_47/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n/tmp/ipykernel_47/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n/tmp/ipykernel_47/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n/tmp/ipykernel_47/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n/tmp/ipykernel_47/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n/tmp/ipykernel_47/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n/tmp/ipykernel_47/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n/tmp/ipykernel_47/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n/tmp/ipykernel_47/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n/tmp/ipykernel_47/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n/tmp/ipykernel_47/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n/tmp/ipykernel_47/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n/tmp/ipykernel_47/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n/tmp/ipykernel_47/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n","output_type":"stream"}],"execution_count":9},{"cell_type":"markdown","source":"## 4.3. Choose the k-fold strategy and on-the-fly data transform functions","metadata":{}},{"cell_type":"code","source":"k_fold_strategy = RepeatedStratifiedKFold(n_splits=CFG.kfold_n_splits, n_repeats=CFG.kfold_n_repeats, random_state=CFG.kfold_random_state)\n\ndef fold_transform_test(df, model) -> pd.DataFrame:\n    for col in cat1 + cat2:\n        df[col] = model.te[col].transform(df[col].to_frame()).astype('float32')\n    return df\n\n\ndef fold_transform_train(df, model) -> pd.DataFrame:\n    if CFG.merge_original_dataset:\n        df = pd.concat((df, df_orig), axis=0, ignore_index=True)\n    model.te = {}\n    for col in cat1 + cat2:\n        #model.te[col] = TargetEncoder(target_type='continuous', smooth=1, cv=10, shuffle=True, random_state=42)\n        model.te[col] = TargetEncoder(n_folds=10, smooth=0, split_method='random', stat='mean')\n        df[col] = model.te[col].fit_transform(df[col].to_frame(), df[CFG.target]).astype('float32')\n    return df","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2025-12-05T22:50:30.479455Z","iopub.execute_input":"2025-12-05T22:50:30.480059Z","iopub.status.idle":"2025-12-05T22:50:30.485868Z","shell.execute_reply.started":"2025-12-05T22:50:30.480036Z","shell.execute_reply":"2025-12-05T22:50:30.485236Z"}},"outputs":[],"execution_count":11},{"cell_type":"markdown","source":"## 4.4. Use optuna, if selected in configuration","metadata":{}},{"cell_type":"code","source":"def xgb_objective(trial):\n    xgb_params = {\n        \"objective\": \"binary:logistic\",\n        \"eval_metric\": \"auc\",\n        \"learning_rate\": trial.suggest_float('learning_rate', 1e-3, 1e-1, step=None, log=True),\n        \"max_depth\": trial.suggest_int('max_depth', 0, 10, step=1, log=False),\n        \"subsample\": trial.suggest_float('subsample', 0, 1, step=0.01, log=False),\n        \"colsample_bytree\": trial.suggest_float('colsample_bytree', 0, 1, step=0.01, log=False),\n        \"seed\": SEED,\n        \"device\": \"cuda\",\n        \"grow_policy\": \"lossguide\",\n        \"alpha\": trial.suggest_float('alpha', 1, 10, step=0.1, log=False),\n        \"lambda\": trial.suggest_float('lambda', 0, 1, step=0.01, log=False),\n        \"min_child_weight\": trial.suggest_int('max_depth', 2, 10, step=1, log=False),\n        \"min_samples_split\": trial.suggest_int('max_depth', 2, 10, step=1, log=False),\n        \"max_bin\": 512,\n\n        'n_estimators': 20_000,\n        'early_stopping_rounds': 300\n    }\n\n    cv = CV(k_fold_strategy,\n        df_train,\n        target=CFG.target,\n        proba=True,\n        fold_transform_train=fold_transform_train,\n        fold_transform_test=fold_transform_test)\n    _, oof_preds = cv.fit(get_model=lambda: XGBWrapper(xgb_params), provide_val_data=True)\n    oof_score = roc_auc_score(df_optuna[CFG.target], oof_preds)\n\n    # Log optuna's results\n    with open('optuna_xgb.txt', 'a') as f:\n        f.write(f'{oof_score:.6f} => {xgb_params}\\n')\n\n    return oof_score\n\n\ndef lgb_objective(trial):\n    lgb_params = {\n        'random_state': CFG.lgb_params['random_state'],\n        'verbose': -1,\n        'n_estimators': 20000,#trial.suggest_int('iterations', 10, 10_000, log=True),\n        'metric': 'AUC',\n        'objective': 'binary',\n        'learning_rate': trial.suggest_float('learning_rate', 1e-4, 1, step=None, log=True),\n        'max_depth': trial.suggest_int('max_depth', 3, 12, step=1),\n        'min_child_samples': trial.suggest_int('min_child_samples', 10, 1000, log=True),\n        'subsample': trial.suggest_float('subsample', 0.01, 1, step=0.01),\n        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.01, 1, step=0.01),\n        'num_leaves': trial.suggest_int('num_leaves', 10, 1000, log=True),\n        'reg_alpha': trial.suggest_float('reg_alpha', 0.01, 1, step=0.01),\n        'reg_lambda': trial.suggest_float('reg_lambda', 0.01, 10, step=0.01),\n        'max_bin': trial.suggest_int('max_bin', 10, 255, log=True),\n        'device': 'gpu',\n    }\n\n    cv = CV(k_fold_strategy,\n        df_optuna,\n        target=CFG.target,\n        proba=True,\n        fold_transform_train=fold_transform_train,\n        fold_transform_test=fold_transform_test)\n    _, oof_preds = cv.fit(get_model=lambda: LGBWrapper2(lgb_params), provide_val_data=True)\n    oof_score = roc_auc_score(df_optuna[CFG.target], oof_preds)\n\n    with open('optuna_lgb.txt', 'a') as f:\n        f.write(f'{oof_score:.6f} => {lgb_params}\\n')\n\n    return oof_score\n    \n\nif CFG.optuna:\n    study = optuna.create_study(direction='maximize')\n    study.optimize(xgb_objective, n_trials=200)\n    print(study.best_params)\n\n    with open('best_params_xgb_optuna.pkl', 'wb') as f:\n        pickle.dump(study.best_params, f)\n    xgb_params = study.best_params\nelse:\n    xgb_params = CFG.xgb_params7_optuna\n    lgb_params = CFG.lgb_params7_optuna    ","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2025-12-05T22:50:43.850880Z","iopub.execute_input":"2025-12-05T22:50:43.851430Z","iopub.status.idle":"2025-12-05T22:50:43.863223Z","shell.execute_reply.started":"2025-12-05T22:50:43.851409Z","shell.execute_reply":"2025-12-05T22:50:43.862264Z"}},"outputs":[],"execution_count":12},{"cell_type":"markdown","source":"## 4.5. Actual training with the optimized parameters","metadata":{}},{"cell_type":"markdown","source":"### 4.5.1. LGB","metadata":{}},{"cell_type":"code","source":"def train_lgb():\n    cv = CV(k_fold_strategy,\n            df_train,\n            target=CFG.target,\n            proba=True,\n            fold_transform_train=fold_transform_train,\n            fold_transform_test=fold_transform_test)\n    \n    _, oof_preds_lgb = cv.fit(get_model=lambda: LGBWrapper(lgb_params), provide_val_data=True)\n    oof_score_lgb = roc_auc_score(df_train[CFG.target], oof_preds_lgb)\n    \n    train_preds_lgb = cv.predict(df_train)\n    train_score_lgb = roc_auc_score(df_train[CFG.target], train_preds_lgb)\n    \n    test_preds_lgb = cv.predict(df_test)\n    \n    # TRAIN score is an overfitted one, so OOF score is correct estimate, while TRAIN should be higher if everything is ok\n    print(f'LGB: OOF score = {oof_score_lgb} / TRAIN score = {train_score_lgb}')\n\n    return test_preds_lgb, train_preds_lgb, oof_preds_lgb\n\n# LGB seems worse, so don't include it\n#test_preds_lgb, train_preds_lgb, oof_preds_lgb = train_lgb()\ntest_preds_lgb, train_preds_lgb, oof_preds_lgb = 0, 0, 0","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2025-12-05T22:50:54.453554Z","iopub.execute_input":"2025-12-05T22:50:54.454200Z","iopub.status.idle":"2025-12-05T22:50:54.459453Z","shell.execute_reply.started":"2025-12-05T22:50:54.454175Z","shell.execute_reply":"2025-12-05T22:50:54.458725Z"}},"outputs":[],"execution_count":14},{"cell_type":"markdown","source":"### 4.5.2. XGB","metadata":{}},{"cell_type":"code","source":"def train_xgb():\n    cv = CV(k_fold_strategy,\n            df_train,\n            target=CFG.target,\n            proba=True,\n            fold_transform_train=fold_transform_train,\n            fold_transform_test=fold_transform_test)\n    \n    _, oof_preds_xgb = cv.fit(get_model=lambda: XGBWrapper(xgb_params), provide_val_data=True)\n    oof_score_xgb = roc_auc_score(df_train[CFG.target], oof_preds_xgb)\n    \n    train_preds_xgb = cv.predict(df_train)\n    train_score_xgb = roc_auc_score(df_train[CFG.target], train_preds_xgb)\n    \n    test_preds_xgb = cv.predict(df_test)\n    \n    # TRAIN score is an overfitted one, so OOF score is correct estimate, while TRAIN should be higher if everything is ok\n    print(f'XGB: OOF score = {oof_score_xgb} / TRAIN score = {train_score_xgb}')\n\n    return test_preds_xgb, train_preds_xgb, oof_preds_xgb\n\ntest_preds_xgb, train_preds_xgb, oof_preds_xgb = train_xgb()","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2025-12-05T22:51:16.211768Z","iopub.execute_input":"2025-12-05T22:51:16.212495Z","iopub.status.idle":"2025-12-05T23:22:09.176206Z","shell.execute_reply.started":"2025-12-05T22:51:16.212468Z","shell.execute_reply":"2025-12-05T23:22:09.175249Z"}},"outputs":[{"name":"stdout","text":"#########################\n### Fold 1 ###\n#########################\n[0]\tvalidation_0-auc:0.68162\n","output_type":"stream"},{"name":"stderr","text":"/usr/local/lib/python3.11/dist-packages/xgboost/core.py:160: UserWarning: [22:51:29] WARNING: /workspace/src/learner.cc:742: \nParameters: { \"min_samples_split\" } are not used.\n\n  warnings.warn(smsg, UserWarning)\n","output_type":"stream"},{"name":"stdout","text":"[300]\tvalidation_0-auc:0.72004\n[600]\tvalidation_0-auc:0.72627\n[900]\tvalidation_0-auc:0.72914\n[1200]\tvalidation_0-auc:0.73036\n[1500]\tvalidation_0-auc:0.73116\n[1800]\tvalidation_0-auc:0.73163\n[2100]\tvalidation_0-auc:0.73196\n[2400]\tvalidation_0-auc:0.73218\n[2700]\tvalidation_0-auc:0.73235\n[3000]\tvalidation_0-auc:0.73245\n[3300]\tvalidation_0-auc:0.73253\n[3600]\tvalidation_0-auc:0.73259\n[3900]\tvalidation_0-auc:0.73264\n[4200]\tvalidation_0-auc:0.73269\n[4500]\tvalidation_0-auc:0.73272\n[4800]\tvalidation_0-auc:0.73275\n[5100]\tvalidation_0-auc:0.73276\n[5400]\tvalidation_0-auc:0.73278\n[5700]\tvalidation_0-auc:0.73277\n[5780]\tvalidation_0-auc:0.73278\n#########################\n### Fold 2 ###\n#########################\n[0]\tvalidation_0-auc:0.67843\n","output_type":"stream"},{"name":"stderr","text":"/usr/local/lib/python3.11/dist-packages/xgboost/core.py:160: UserWarning: [22:54:02] WARNING: /workspace/src/learner.cc:742: \nParameters: { \"min_samples_split\" } are not used.\n\n  warnings.warn(smsg, UserWarning)\n","output_type":"stream"},{"name":"stdout","text":"[300]\tvalidation_0-auc:0.71676\n[600]\tvalidation_0-auc:0.72340\n[900]\tvalidation_0-auc:0.72661\n[1200]\tvalidation_0-auc:0.72800\n[1500]\tvalidation_0-auc:0.72902\n[1800]\tvalidation_0-auc:0.72962\n[2100]\tvalidation_0-auc:0.72999\n[2400]\tvalidation_0-auc:0.73024\n[2700]\tvalidation_0-auc:0.73043\n[3000]\tvalidation_0-auc:0.73060\n[3300]\tvalidation_0-auc:0.73072\n[3600]\tvalidation_0-auc:0.73081\n[3900]\tvalidation_0-auc:0.73087\n[4200]\tvalidation_0-auc:0.73092\n[4500]\tvalidation_0-auc:0.73097\n[4800]\tvalidation_0-auc:0.73100\n[5100]\tvalidation_0-auc:0.73104\n[5400]\tvalidation_0-auc:0.73105\n[5700]\tvalidation_0-auc:0.73106\n[6000]\tvalidation_0-auc:0.73107\n[6300]\tvalidation_0-auc:0.73108\n[6600]\tvalidation_0-auc:0.73110\n[6900]\tvalidation_0-auc:0.73111\n[7200]\tvalidation_0-auc:0.73111\n[7233]\tvalidation_0-auc:0.73111\n#########################\n### Fold 3 ###\n#########################\n[0]\tvalidation_0-auc:0.68148\n","output_type":"stream"},{"name":"stderr","text":"/usr/local/lib/python3.11/dist-packages/xgboost/core.py:160: UserWarning: [22:57:07] WARNING: /workspace/src/learner.cc:742: \nParameters: { \"min_samples_split\" } are not used.\n\n  warnings.warn(smsg, UserWarning)\n","output_type":"stream"},{"name":"stdout","text":"[300]\tvalidation_0-auc:0.71915\n[600]\tvalidation_0-auc:0.72487\n[900]\tvalidation_0-auc:0.72747\n[1200]\tvalidation_0-auc:0.72856\n[1500]\tvalidation_0-auc:0.72921\n[1800]\tvalidation_0-auc:0.72963\n[2100]\tvalidation_0-auc:0.72991\n[2400]\tvalidation_0-auc:0.73008\n[2700]\tvalidation_0-auc:0.73021\n[3000]\tvalidation_0-auc:0.73030\n[3300]\tvalidation_0-auc:0.73040\n[3600]\tvalidation_0-auc:0.73046\n[3900]\tvalidation_0-auc:0.73051\n[4200]\tvalidation_0-auc:0.73056\n[4500]\tvalidation_0-auc:0.73060\n[4800]\tvalidation_0-auc:0.73063\n[5100]\tvalidation_0-auc:0.73063\n[5400]\tvalidation_0-auc:0.73065\n[5700]\tvalidation_0-auc:0.73065\n[5929]\tvalidation_0-auc:0.73066\n#########################\n### Fold 4 ###\n#########################\n[0]\tvalidation_0-auc:0.67961\n","output_type":"stream"},{"name":"stderr","text":"/usr/local/lib/python3.11/dist-packages/xgboost/core.py:160: UserWarning: [22:59:43] WARNING: /workspace/src/learner.cc:742: \nParameters: { \"min_samples_split\" } are not used.\n\n  warnings.warn(smsg, UserWarning)\n","output_type":"stream"},{"name":"stdout","text":"[300]\tvalidation_0-auc:0.71684\n[600]\tvalidation_0-auc:0.72308\n[900]\tvalidation_0-auc:0.72613\n[1200]\tvalidation_0-auc:0.72747\n[1500]\tvalidation_0-auc:0.72839\n[1800]\tvalidation_0-auc:0.72895\n[2100]\tvalidation_0-auc:0.72930\n[2400]\tvalidation_0-auc:0.72954\n[2700]\tvalidation_0-auc:0.72971\n[3000]\tvalidation_0-auc:0.72983\n[3300]\tvalidation_0-auc:0.72993\n[3600]\tvalidation_0-auc:0.73001\n[3900]\tvalidation_0-auc:0.73008\n[4200]\tvalidation_0-auc:0.73013\n[4500]\tvalidation_0-auc:0.73017\n[4800]\tvalidation_0-auc:0.73021\n[5100]\tvalidation_0-auc:0.73024\n[5400]\tvalidation_0-auc:0.73026\n[5700]\tvalidation_0-auc:0.73026\n[6000]\tvalidation_0-auc:0.73028\n[6300]\tvalidation_0-auc:0.73030\n[6600]\tvalidation_0-auc:0.73030\n[6685]\tvalidation_0-auc:0.73030\n#########################\n### Fold 5 ###\n#########################\n[0]\tvalidation_0-auc:0.68272\n","output_type":"stream"},{"name":"stderr","text":"/usr/local/lib/python3.11/dist-packages/xgboost/core.py:160: UserWarning: [23:02:36] WARNING: /workspace/src/learner.cc:742: \nParameters: { \"min_samples_split\" } are not used.\n\n  warnings.warn(smsg, UserWarning)\n","output_type":"stream"},{"name":"stdout","text":"[300]\tvalidation_0-auc:0.71973\n[600]\tvalidation_0-auc:0.72562\n[900]\tvalidation_0-auc:0.72844\n[1200]\tvalidation_0-auc:0.72970\n[1500]\tvalidation_0-auc:0.73056\n[1800]\tvalidation_0-auc:0.73106\n[2100]\tvalidation_0-auc:0.73141\n[2400]\tvalidation_0-auc:0.73163\n[2700]\tvalidation_0-auc:0.73180\n[3000]\tvalidation_0-auc:0.73193\n[3300]\tvalidation_0-auc:0.73201\n[3600]\tvalidation_0-auc:0.73208\n[3900]\tvalidation_0-auc:0.73212\n[4200]\tvalidation_0-auc:0.73215\n[4500]\tvalidation_0-auc:0.73220\n[4800]\tvalidation_0-auc:0.73222\n[5100]\tvalidation_0-auc:0.73223\n[5214]\tvalidation_0-auc:0.73223\n#########################\n### Fold 6 ###\n#########################\n[0]\tvalidation_0-auc:0.68152\n","output_type":"stream"},{"name":"stderr","text":"/usr/local/lib/python3.11/dist-packages/xgboost/core.py:160: UserWarning: [23:04:55] WARNING: /workspace/src/learner.cc:742: \nParameters: { \"min_samples_split\" } are not used.\n\n  warnings.warn(smsg, UserWarning)\n","output_type":"stream"},{"name":"stdout","text":"[300]\tvalidation_0-auc:0.71968\n[600]\tvalidation_0-auc:0.72583\n[900]\tvalidation_0-auc:0.72869\n[1200]\tvalidation_0-auc:0.72990\n[1500]\tvalidation_0-auc:0.73074\n[1800]\tvalidation_0-auc:0.73119\n[2100]\tvalidation_0-auc:0.73149\n[2400]\tvalidation_0-auc:0.73169\n[2700]\tvalidation_0-auc:0.73184\n[3000]\tvalidation_0-auc:0.73196\n[3300]\tvalidation_0-auc:0.73203\n[3600]\tvalidation_0-auc:0.73210\n[3900]\tvalidation_0-auc:0.73216\n[4200]\tvalidation_0-auc:0.73221\n[4500]\tvalidation_0-auc:0.73225\n[4800]\tvalidation_0-auc:0.73228\n[5100]\tvalidation_0-auc:0.73230\n[5400]\tvalidation_0-auc:0.73231\n[5700]\tvalidation_0-auc:0.73232\n[6000]\tvalidation_0-auc:0.73233\n[6300]\tvalidation_0-auc:0.73235\n[6600]\tvalidation_0-auc:0.73235\n[6766]\tvalidation_0-auc:0.73234\n#########################\n### Fold 7 ###\n#########################\n[0]\tvalidation_0-auc:0.67819\n","output_type":"stream"},{"name":"stderr","text":"/usr/local/lib/python3.11/dist-packages/xgboost/core.py:160: UserWarning: [23:07:51] WARNING: /workspace/src/learner.cc:742: \nParameters: { \"min_samples_split\" } are not used.\n\n  warnings.warn(smsg, UserWarning)\n","output_type":"stream"},{"name":"stdout","text":"[300]\tvalidation_0-auc:0.71583\n[600]\tvalidation_0-auc:0.72208\n[900]\tvalidation_0-auc:0.72522\n[1200]\tvalidation_0-auc:0.72656\n[1500]\tvalidation_0-auc:0.72749\n[1800]\tvalidation_0-auc:0.72804\n[2100]\tvalidation_0-auc:0.72841\n[2400]\tvalidation_0-auc:0.72865\n[2700]\tvalidation_0-auc:0.72882\n[3000]\tvalidation_0-auc:0.72895\n[3300]\tvalidation_0-auc:0.72907\n[3600]\tvalidation_0-auc:0.72915\n[3900]\tvalidation_0-auc:0.72922\n[4200]\tvalidation_0-auc:0.72927\n[4500]\tvalidation_0-auc:0.72931\n[4800]\tvalidation_0-auc:0.72933\n[5100]\tvalidation_0-auc:0.72937\n[5400]\tvalidation_0-auc:0.72939\n[5700]\tvalidation_0-auc:0.72939\n[5951]\tvalidation_0-auc:0.72939\n#########################\n### Fold 8 ###\n#########################\n[0]\tvalidation_0-auc:0.68154\n","output_type":"stream"},{"name":"stderr","text":"/usr/local/lib/python3.11/dist-packages/xgboost/core.py:160: UserWarning: [23:10:27] WARNING: /workspace/src/learner.cc:742: \nParameters: { \"min_samples_split\" } are not used.\n\n  warnings.warn(smsg, UserWarning)\n","output_type":"stream"},{"name":"stdout","text":"[300]\tvalidation_0-auc:0.71957\n[600]\tvalidation_0-auc:0.72539\n[900]\tvalidation_0-auc:0.72820\n[1200]\tvalidation_0-auc:0.72940\n[1500]\tvalidation_0-auc:0.73021\n[1800]\tvalidation_0-auc:0.73073\n[2100]\tvalidation_0-auc:0.73105\n[2400]\tvalidation_0-auc:0.73125\n[2700]\tvalidation_0-auc:0.73137\n[3000]\tvalidation_0-auc:0.73150\n[3300]\tvalidation_0-auc:0.73157\n[3600]\tvalidation_0-auc:0.73164\n[3900]\tvalidation_0-auc:0.73168\n[4200]\tvalidation_0-auc:0.73172\n[4500]\tvalidation_0-auc:0.73175\n[4800]\tvalidation_0-auc:0.73177\n[5100]\tvalidation_0-auc:0.73178\n[5400]\tvalidation_0-auc:0.73181\n[5700]\tvalidation_0-auc:0.73182\n[6000]\tvalidation_0-auc:0.73185\n[6300]\tvalidation_0-auc:0.73184\n[6311]\tvalidation_0-auc:0.73184\n#########################\n### Fold 9 ###\n#########################\n[0]\tvalidation_0-auc:0.68035\n","output_type":"stream"},{"name":"stderr","text":"/usr/local/lib/python3.11/dist-packages/xgboost/core.py:160: UserWarning: [23:13:12] WARNING: /workspace/src/learner.cc:742: \nParameters: { \"min_samples_split\" } are not used.\n\n  warnings.warn(smsg, UserWarning)\n","output_type":"stream"},{"name":"stdout","text":"[300]\tvalidation_0-auc:0.71791\n[600]\tvalidation_0-auc:0.72425\n[900]\tvalidation_0-auc:0.72715\n[1200]\tvalidation_0-auc:0.72843\n[1500]\tvalidation_0-auc:0.72932\n[1800]\tvalidation_0-auc:0.72987\n[2100]\tvalidation_0-auc:0.73020\n[2400]\tvalidation_0-auc:0.73044\n[2700]\tvalidation_0-auc:0.73061\n[3000]\tvalidation_0-auc:0.73074\n[3300]\tvalidation_0-auc:0.73084\n[3600]\tvalidation_0-auc:0.73093\n[3900]\tvalidation_0-auc:0.73100\n[4200]\tvalidation_0-auc:0.73103\n[4500]\tvalidation_0-auc:0.73107\n[4800]\tvalidation_0-auc:0.73109\n[5100]\tvalidation_0-auc:0.73112\n[5400]\tvalidation_0-auc:0.73113\n[5700]\tvalidation_0-auc:0.73114\n[6000]\tvalidation_0-auc:0.73115\n[6300]\tvalidation_0-auc:0.73116\n[6600]\tvalidation_0-auc:0.73116\n[6794]\tvalidation_0-auc:0.73117\n#########################\n### Fold 10 ###\n#########################\n[0]\tvalidation_0-auc:0.68224\n","output_type":"stream"},{"name":"stderr","text":"/usr/local/lib/python3.11/dist-packages/xgboost/core.py:160: UserWarning: [23:16:07] WARNING: /workspace/src/learner.cc:742: \nParameters: { \"min_samples_split\" } are not used.\n\n  warnings.warn(smsg, UserWarning)\n","output_type":"stream"},{"name":"stdout","text":"[300]\tvalidation_0-auc:0.71975\n[600]\tvalidation_0-auc:0.72602\n[900]\tvalidation_0-auc:0.72895\n[1200]\tvalidation_0-auc:0.73020\n[1500]\tvalidation_0-auc:0.73106\n[1800]\tvalidation_0-auc:0.73158\n[2100]\tvalidation_0-auc:0.73189\n[2400]\tvalidation_0-auc:0.73210\n[2700]\tvalidation_0-auc:0.73224\n[3000]\tvalidation_0-auc:0.73234\n[3300]\tvalidation_0-auc:0.73242\n[3600]\tvalidation_0-auc:0.73248\n[3900]\tvalidation_0-auc:0.73254\n[4200]\tvalidation_0-auc:0.73257\n[4500]\tvalidation_0-auc:0.73261\n[4800]\tvalidation_0-auc:0.73264\n[5100]\tvalidation_0-auc:0.73264\n[5400]\tvalidation_0-auc:0.73265\n[5700]\tvalidation_0-auc:0.73266\n[6000]\tvalidation_0-auc:0.73266\n[6300]\tvalidation_0-auc:0.73268\n[6600]\tvalidation_0-auc:0.73269\n[6865]\tvalidation_0-auc:0.73267\nXGB: OOF score = 0.7317538366708274 / TRAIN score = 0.7460631139393147\n","output_type":"stream"}],"execution_count":15},{"cell_type":"markdown","source":"### 4.5.3 Combine the predictions of two classifiers","metadata":{}},{"cell_type":"code","source":"test_preds = 0.5 * test_preds_xgb + 0.5 * test_preds_lgb\noof_preds = 0.5 * oof_preds_xgb + 0.5 * oof_preds_lgb\ntrain_preds = 0.5 * train_preds_xgb + 0.5 * train_preds_lgb\n\noof_score = roc_auc_score(df_train[CFG.target], oof_preds)\ntrain_score = roc_auc_score(df_train[CFG.target], train_preds)\n\n# TRAIN score is an overfitted one, so OOF score is correct estimate, while TRAIN should be higher if everything is ok\nprint(f'XGB: OOF score = {oof_score} / TRAIN score = {train_score}')","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2025-12-05T23:22:09.553760Z","iopub.execute_input":"2025-12-05T23:22:09.554051Z","iopub.status.idle":"2025-12-05T23:22:09.929733Z","shell.execute_reply.started":"2025-12-05T23:22:09.554028Z","shell.execute_reply":"2025-12-05T23:22:09.929137Z"}},"outputs":[{"name":"stdout","text":"XGB: OOF score = 0.7317538366708274 / TRAIN score = 0.7460631139393147\n","output_type":"stream"}],"execution_count":17},{"cell_type":"markdown","source":"# 5. Submit the results","metadata":{}},{"cell_type":"code","source":"# Save the results\nfname = 'submission.csv'\nsubmission = pd.read_csv(CFG.sample_submission_csv)\nsubmission[CFG.target] = test_preds\nsubmission.to_csv(fname, index=False)\nsubmission.head()","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2025-12-05T23:43:46.255756Z","iopub.execute_input":"2025-12-05T23:43:46.256070Z","iopub.status.idle":"2025-12-05T23:43:46.740967Z","shell.execute_reply.started":"2025-12-05T23:43:46.256047Z","shell.execute_reply":"2025-12-05T23:43:46.740232Z"}},"outputs":[{"execution_count":22,"output_type":"execute_result","data":{"text/plain":"       id  diagnosed_diabetes\n0  700000            0.236527\n1  700001            0.368034\n2  700002            0.394842\n3  700003            0.187408\n4  700004            0.469889","text/html":"<div>\n<style scoped>\n    .dataframe tbody tr th:only-of-type {\n        vertical-align: middle;\n    }\n\n    .dataframe tbody tr th {\n        vertical-align: top;\n    }\n\n    .dataframe thead th {\n        text-align: right;\n    }\n</style>\n<table border=\"1\" class=\"dataframe\">\n  <thead>\n    <tr style=\"text-align: right;\">\n      <th></th>\n      <th>id</th>\n      <th>diagnosed_diabetes</th>\n    </tr>\n  </thead>\n  <tbody>\n    <tr>\n      <th>0</th>\n      <td>700000</td>\n      <td>0.236527</td>\n    </tr>\n    <tr>\n      <th>1</th>\n      <td>700001</td>\n      <td>0.368034</td>\n    </tr>\n    <tr>\n      <th>2</th>\n      <td>700002</td>\n      <td>0.394842</td>\n    </tr>\n    <tr>\n      <th>3</th>\n      <td>700003</td>\n      <td>0.187408</td>\n    </tr>\n    <tr>\n      <th>4</th>\n      <td>700004</td>\n      <td>0.469889</td>\n    </tr>\n  </tbody>\n</table>\n</div>"},"metadata":{}}],"execution_count":22},{"cell_type":"code","source":"","metadata":{"trusted":true},"outputs":[],"execution_count":null}]}
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "id": "f3e0768e",
+   "metadata": {
+    "papermill": {
+     "duration": 0.004931,
+     "end_time": "2025-12-06T00:50:44.154410",
+     "exception": false,
+     "start_time": "2025-12-06T00:50:44.149479",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "# 1. Import libraries"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "id": "c1015903",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-12-06T00:50:44.163859Z",
+     "iopub.status.busy": "2025-12-06T00:50:44.163229Z",
+     "iopub.status.idle": "2025-12-06T00:50:56.581639Z",
+     "shell.execute_reply": "2025-12-06T00:50:56.581021Z"
+    },
+    "papermill": {
+     "duration": 12.424336,
+     "end_time": "2025-12-06T00:50:56.582918",
+     "exception": false,
+     "start_time": "2025-12-06T00:50:44.158582",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "from cuml.preprocessing import TargetEncoder\n",
+    "from itertools import combinations\n",
+    "from lightgbm import LGBMClassifier\n",
+    "import numpy as np\n",
+    "import os\n",
+    "import optuna\n",
+    "import pickle\n",
+    "import pandas as pd\n",
+    "from sklearn.model_selection import RepeatedStratifiedKFold\n",
+    "from sklearn.metrics import roc_auc_score\n",
+    "from typing import Callable, Optional\n",
+    "import xgboost as xgb\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "e57f8ac9",
+   "metadata": {
+    "papermill": {
+     "duration": 0.003946,
+     "end_time": "2025-12-06T00:50:56.591256",
+     "exception": false,
+     "start_time": "2025-12-06T00:50:56.587310",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "# 2. Configuration"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "id": "2eb16ea8",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-12-06T00:50:56.600075Z",
+     "iopub.status.busy": "2025-12-06T00:50:56.599850Z",
+     "iopub.status.idle": "2025-12-06T00:50:56.605115Z",
+     "shell.execute_reply": "2025-12-06T00:50:56.604607Z"
+    },
+    "papermill": {
+     "duration": 0.011024,
+     "end_time": "2025-12-06T00:50:56.606258",
+     "exception": false,
+     "start_time": "2025-12-06T00:50:56.595234",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "SEED = 2025\n",
+    "\n",
+    "class CFG:\n",
+    "    train_csv = '/kaggle/input/playground-series-s5e12/train.csv'\n",
+    "    test_csv = '/kaggle/input/playground-series-s5e12/test.csv'\n",
+    "    orig_csv = '/kaggle/input/diabetes-health-indicators-dataset/diabetes_dataset.csv'\n",
+    "    sample_submission_csv = '/kaggle/input/playground-series-s5e12/sample_submission.csv'\n",
+    "    target = 'diagnosed_diabetes'\n",
+    "    output = 'submission/%s.csv'\n",
+    "    ag_presets = 'best_quality'\n",
+    "    ag_time_limit = 4*3600\n",
+    "\n",
+    "    kfold_n_splits = 5\n",
+    "    kfold_n_repeats = 2\n",
+    "    kfold_random_state = SEED\n",
+    "\n",
+    "    optuna = False\n",
+    "\n",
+    "    merge_original_dataset = False\n",
+    "\n",
+    "    xgb_params7_optuna = {\n",
+    "        'objective': 'binary:logistic',\n",
+    "        'eval_metric': 'auc',\n",
+    "        'learning_rate': 0.008559367757686604,\n",
+    "        'max_depth': 5,\n",
+    "        'subsample': 0.93,\n",
+    "        'colsample_bytree': 0.19,\n",
+    "        'seed': 2025,\n",
+    "        'device': 'cuda',\n",
+    "        'grow_policy': 'lossguide',\n",
+    "        'alpha': 2.0,\n",
+    "        'lambda': 0.73,\n",
+    "        'min_child_weight': 5,\n",
+    "        'min_samples_split': 5,\n",
+    "        'max_bin': 512,\n",
+    "        'n_estimators': 20000,\n",
+    "        'early_stopping_rounds': 300\n",
+    "    }\n",
+    "\n",
+    "    lgb_params7_optuna = {\n",
+    "        'random_state': SEED,\n",
+    "        'verbose': -1,\n",
+    "        'n_estimators': 10_000,\n",
+    "        'metric': 'AUC',\n",
+    "        'objective': 'binary',\n",
+    "        'learning_rate': 0.0002975707557336301,\n",
+    "        'max_depth': 6,\n",
+    "        'min_child_samples': 14,\n",
+    "        'subsample': 0.88,\n",
+    "        'colsample_bytree': 0.72,\n",
+    "        'num_leaves': 575,\n",
+    "        'reg_alpha': 0.79,\n",
+    "        'reg_lambda': 9.96,\n",
+    "        'max_bin': 157,\n",
+    "    }"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "89350106",
+   "metadata": {
+    "papermill": {
+     "duration": 0.003847,
+     "end_time": "2025-12-06T00:50:56.614100",
+     "exception": false,
+     "start_time": "2025-12-06T00:50:56.610253",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "# 3. Helper classes and functions"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "84109a2a",
+   "metadata": {
+    "papermill": {
+     "duration": 0.003739,
+     "end_time": "2025-12-06T00:50:56.621688",
+     "exception": false,
+     "start_time": "2025-12-06T00:50:56.617949",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "## 3.1. For CV"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "id": "3a780390",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-12-06T00:50:56.630730Z",
+     "iopub.status.busy": "2025-12-06T00:50:56.630527Z",
+     "iopub.status.idle": "2025-12-06T00:50:56.639028Z",
+     "shell.execute_reply": "2025-12-06T00:50:56.638528Z"
+    },
+    "papermill": {
+     "duration": 0.014007,
+     "end_time": "2025-12-06T00:50:56.639935",
+     "exception": false,
+     "start_time": "2025-12-06T00:50:56.625928",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "class CV:\n",
+    "    def __init__(self,\n",
+    "                 k_fold_strategy,\n",
+    "                 df_train: pd.DataFrame,\n",
+    "                 target: str,\n",
+    "                 proba: bool=False,\n",
+    "                 fold_transform_train: Optional[Callable]=None,\n",
+    "                 fold_transform_test: Optional[Callable]=None\n",
+    "                 ) -> None:\n",
+    "        self.k_fold_strategy = k_fold_strategy\n",
+    "        self.df = df_train\n",
+    "        self.y = df_train[target]\n",
+    "        self.target = target\n",
+    "        self.proba = proba\n",
+    "        self.fold_transform_train = fold_transform_train if fold_transform_train else lambda inp, model:inp\n",
+    "        self.fold_transform_test = fold_transform_test if fold_transform_test else lambda inp, model:inp\n",
+    "\n",
+    "\n",
+    "    def fit(self, get_model: Callable, provide_val_data: bool=False) -> tuple[list, np.ndarray]:\n",
+    "        self.models = []\n",
+    "        oof_preds = np.zeros_like(self.y)\n",
+    "        for fold, (train_index, test_index) in enumerate(self.k_fold_strategy.split(self.y, self.y)):\n",
+    "            print(\"#\" * 25)\n",
+    "            print(f\"### Fold {fold + 1} ###\")\n",
+    "            print(\"#\" * 25)\n",
+    "\n",
+    "            model = get_model()\n",
+    "\n",
+    "            x_train = self.fold_transform_train(self.df.iloc[train_index].copy(), model)\n",
+    "            y_train = x_train.pop(self.target)\n",
+    "\n",
+    "            x_test = self.fold_transform_test(self.df.iloc[test_index].copy(), model)\n",
+    "            y_test = x_test.pop(self.target)\n",
+    "\n",
+    "            if provide_val_data:\n",
+    "                model.fit(x_train, y_train, x_test, y_test)\n",
+    "            else:\n",
+    "                model.fit(x_train, y_train)\n",
+    "\n",
+    "            if self.proba:\n",
+    "                proba = model.predict_proba(x_test)\n",
+    "                if hasattr(proba, 'to_numpy'):\n",
+    "                    proba = proba.to_numpy()\n",
+    "                oof_preds[test_index] += proba[:, 1]\n",
+    "            else:\n",
+    "                oof_preds[test_index] += model.predict(x_test)\n",
+    "            self.models.append(model)\n",
+    "        return self.models, oof_preds\n",
+    "\n",
+    "\n",
+    "    def predict(self, df_test: pd.DataFrame) -> np.ndarray:\n",
+    "        if self.target in df_test.columns:\n",
+    "            df_test = df_test.drop(self.target, axis=1)\n",
+    "        preds = 0\n",
+    "        for model in self.models:\n",
+    "            df_test_transformed = self.fold_transform_test(df_test.copy(), model)\n",
+    "            if self.proba:\n",
+    "                proba = model.predict_proba(df_test_transformed)\n",
+    "                if hasattr(proba, 'to_numpy'):\n",
+    "                    proba = proba.to_numpy()\n",
+    "                preds += proba[:, 1]\n",
+    "            else:\n",
+    "                preds += model.predict(df_test_transformed)\n",
+    "        return preds / len(self.models)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "390c1eeb",
+   "metadata": {
+    "papermill": {
+     "duration": 0.003896,
+     "end_time": "2025-12-06T00:50:56.647916",
+     "exception": false,
+     "start_time": "2025-12-06T00:50:56.644020",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "## 3.2. For FE"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "id": "948813b0",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-12-06T00:50:56.657738Z",
+     "iopub.status.busy": "2025-12-06T00:50:56.657535Z",
+     "iopub.status.idle": "2025-12-06T00:50:56.673586Z",
+     "shell.execute_reply": "2025-12-06T00:50:56.672883Z"
+    },
+    "papermill": {
+     "duration": 0.022468,
+     "end_time": "2025-12-06T00:50:56.674592",
+     "exception": false,
+     "start_time": "2025-12-06T00:50:56.652124",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "class FeatureEngineer:\n",
+    "    def __init__(self, df: pd.DataFrame, target: str) -> None:\n",
+    "        self.df = df\n",
+    "        self.target = target\n",
+    "\n",
+    "    def columns_x_info(self) -> tuple[list, list]:\n",
+    "        \"\"\"\n",
+    "        Print the dataframe columns info and split columns by their type\n",
+    "        Target columns is skipped, so only X columns are analysed\n",
+    "        \"\"\"\n",
+    "        categoric = []\n",
+    "        numeric = []\n",
+    "        for col in self.df.columns:\n",
+    "            if col in [self.target, '_dataset']:\n",
+    "                continue\n",
+    "\n",
+    "            if self.df[col].dtype == 'object':\n",
+    "                categoric.append(col)\n",
+    "                tp = 'CAT'\n",
+    "            else:\n",
+    "                numeric.append(col)\n",
+    "                tp = 'NUM'\n",
+    "            num_values = self.df[col].nunique()\n",
+    "            nans = self.df[col].isna().sum()\n",
+    "            print(f\"[{tp}] {col} has {num_values} unique values and {nans} NANs\")\n",
+    "        print(\"Categoric:\", categoric )\n",
+    "        print(\"Numeric:\", numeric )\n",
+    "        return categoric, numeric\n",
+    "\n",
+    "    def label_encoder_categoric(self, categoric: list[str]) -> None:\n",
+    "        \"\"\"\n",
+    "        Inplace transform all categoric columns to the columns with integer-only values\n",
+    "        \"\"\"\n",
+    "        for col in categoric:\n",
+    "            self.df[col] = self.df[col].factorize()[0].astype('int32')\n",
+    "\n",
+    "    def label_encoder_numeric(self, numeric: list[str], suffix: str = '_cat') -> list[str]:\n",
+    "        \"\"\"\n",
+    "        Inplace duplicate numeric columns transforming them to categorical ones\n",
+    "        \"\"\"\n",
+    "        new_cols = []\n",
+    "        for col in numeric:\n",
+    "            self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n",
+    "            new_cols.append(col + suffix)\n",
+    "        return new_cols\n",
+    "\n",
+    "    def create_categoric_pairs(self, categoric: list[str], inplace: bool=True) -> pd.DataFrame:\n",
+    "        \"\"\"\n",
+    "        Combine previously label-encoded categorical columns into one new dataframe\n",
+    "        \"\"\"\n",
+    "        pairs = list(combinations(categoric, 2))\n",
+    "        return self.create_pairs(pairs, inplace)\n",
+    "\n",
+    "    def create_pairs(self, pairs: list[tuple[str,str]], inplace: bool=True, to_str: bool=False) -> pd.DataFrame:\n",
+    "        \"\"\"\n",
+    "        Combine pairs of categorical columns\n",
+    "        \"\"\"\n",
+    "        combined_df = {}\n",
+    "        for col1, col2 in pairs:\n",
+    "            combined = \"_\".join(sorted((col1, col2)))\n",
+    "            if to_str:\n",
+    "                combined_df[combined] = self.df[col1].astype(str) + '_' + self.df[col2].astype(str)\n",
+    "            else:\n",
+    "                combined_df[combined] = self.df[col1] * (1 + max(self.df[col2])) + self.df[col2]\n",
+    "        combined_df = pd.DataFrame(combined_df)\n",
+    "\n",
+    "        if inplace:\n",
+    "            self.df = pd.concat([self.df, combined_df], axis=1)\n",
+    "\n",
+    "        return combined_df\n",
+    "\n",
+    "    def count_encoder_categoric(self, categoric: list[str], suffix: str='_cnt') -> list[str]:\n",
+    "        \"\"\"\n",
+    "        Inplace addition of count-encoded categorical columns\n",
+    "        \"\"\"\n",
+    "        new_cols = []\n",
+    "        for col in categoric:\n",
+    "            col_cnt = self.df.groupby(col)[self.target].count().astype('int32')\n",
+    "            col_cnt.name = col + suffix\n",
+    "            new_cols.append(col_cnt.name)\n",
+    "            self.df = self.df.merge(col_cnt, on=col, how='left')\n",
+    "        return new_cols\n",
+    "\n",
+    "    def target_encoder_categoric(self, categoric: list[str], dataset: pd.DataFrame, suffix: str='_trg') -> list[str]:\n",
+    "        \"\"\"\n",
+    "        Inplace addition of target-encoded categorical columns using the specified dataset for calculations\n",
+    "        \"\"\"\n",
+    "        new_cols = []\n",
+    "        for col in categoric:\n",
+    "            col_trg = dataset.groupby(col)[self.target].mean()\n",
+    "            col_trg.name = col + suffix\n",
+    "            new_cols.append(col_trg.name)\n",
+    "            self.df = self.df.merge(col_trg, on=col, how='left')\n",
+    "        return new_cols\n",
+    "        \n",
+    "    def add_bin_features(self, numeric: list[str], q: int=5, suffix: str='_bin'):\n",
+    "        \"\"\"\n",
+    "        Inplace addition of bins for the specified numeric features, thus transforming them to categoric\n",
+    "        \"\"\"\n",
+    "        new_cols = []\n",
+    "        for col in numeric:\n",
+    "            self.df[col + suffix], _ = pd.qcut(self.df[col], q=q, labels=False, retbins=True, duplicates=\"drop\")\n",
+    "            new_cols.append(col + suffix)\n",
+    "        return new_cols\n",
+    "\n",
+    "    def add_digit_features(self, numeric: list[str], suffix: str='_dig'):\n",
+    "        \"\"\"\n",
+    "        Inplace addition of digit features\n",
+    "        \"\"\"\n",
+    "        new_cols = []\n",
+    "        for col in numeric:\n",
+    "            sp = self.df[col].astype(str).str.split('.', expand=True).fillna('')\n",
+    "            b = max(sp[0].astype(str).str.len())\n",
+    "            a = max(sp[1].astype(str).str.len()) if 1 in sp.columns else 0\n",
+    "\n",
+    "            for k in range(1 - b, a + 1):\n",
+    "                new_col = f'{col}{suffix}{k}'\n",
+    "                self.df[new_col] = ((self.df[col] * 10**k) % 10).fillna(-1).astype(\"int8\")\n",
+    "                new_cols.append(new_col)\n",
+    "        return new_cols\n",
+    "\n",
+    "    def add_round_features(self, numeric: list[str], round: list=[-1, 0], suffix: str='_round'):\n",
+    "        \"\"\"\n",
+    "        Inplace addition of rounded features\n",
+    "        \"\"\"\n",
+    "        new_cols = []\n",
+    "        for col in numeric:\n",
+    "            for r in round:\n",
+    "                new_col = f'{col}{suffix}{r}'\n",
+    "                self.df[new_col] = self.df[col].round(r)\n",
+    "                new_cols.append(new_col)\n",
+    "        return new_cols\n",
+    "\n",
+    "    def astype(self, columns, to_type):\n",
+    "        \"\"\"\n",
+    "        Transform the columns' type\n",
+    "        \"\"\"\n",
+    "        self.df[columns] = self.df[columns].astype(to_type)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "8a74daa7",
+   "metadata": {
+    "papermill": {
+     "duration": 0.003754,
+     "end_time": "2025-12-06T00:50:56.682165",
+     "exception": false,
+     "start_time": "2025-12-06T00:50:56.678411",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "## 3.3. Wrapper classes"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "id": "f4bafe8a",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-12-06T00:50:56.690834Z",
+     "iopub.status.busy": "2025-12-06T00:50:56.690637Z",
+     "iopub.status.idle": "2025-12-06T00:50:56.695391Z",
+     "shell.execute_reply": "2025-12-06T00:50:56.694904Z"
+    },
+    "papermill": {
+     "duration": 0.010315,
+     "end_time": "2025-12-06T00:50:56.696357",
+     "exception": false,
+     "start_time": "2025-12-06T00:50:56.686042",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "class XGBWrapper:\n",
+    "    def __init__(self, xgb_params: dict) -> None:\n",
+    "        self.model = xgb.XGBClassifier(**xgb_params)\n",
+    "\n",
+    "    def fit(self, x, y, val_x, val_y):\n",
+    "        self.model.fit(x, y, eval_set=[(val_x, val_y)], verbose=300)\n",
+    "\n",
+    "    def predict_proba(self, x):\n",
+    "        return self.model.predict_proba(x, iteration_range=(0, self.model.best_iteration + 1))\n",
+    "\n",
+    "\n",
+    "class LGBWrapper:\n",
+    "    def __init__(self, lgb_params: dict) -> None:\n",
+    "        self.model = LGBMClassifier(**lgb_params)\n",
+    "\n",
+    "    def fit(self, x, y, val_x, val_y):\n",
+    "        self.model.fit(x, y, eval_set=[(val_x, val_y)])\n",
+    "\n",
+    "    def predict_proba(self, x):\n",
+    "        return self.model.predict_proba(x)\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "c49bd902",
+   "metadata": {
+    "papermill": {
+     "duration": 0.003816,
+     "end_time": "2025-12-06T00:50:56.704058",
+     "exception": false,
+     "start_time": "2025-12-06T00:50:56.700242",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "## 3.4. Dataset load/combine/split"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "id": "25cc7235",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-12-06T00:50:56.712467Z",
+     "iopub.status.busy": "2025-12-06T00:50:56.712272Z",
+     "iopub.status.idle": "2025-12-06T00:50:56.717571Z",
+     "shell.execute_reply": "2025-12-06T00:50:56.717029Z"
+    },
+    "papermill": {
+     "duration": 0.010791,
+     "end_time": "2025-12-06T00:50:56.718625",
+     "exception": false,
+     "start_time": "2025-12-06T00:50:56.707834",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "def load_combined_dataset(*datasets_csv, target: str) -> pd.DataFrame:\n",
+    "    dfs = []\n",
+    "    columns = None\n",
+    "\n",
+    "    for n, csv in enumerate(datasets_csv):\n",
+    "        df = pd.read_csv(csv)\n",
+    "        if 'id' in df.columns:\n",
+    "            df = df.drop(columns='id')\n",
+    "        df['_dataset'] = n\n",
+    "\n",
+    "        if columns is None:\n",
+    "            columns = set(df.columns)\n",
+    "        else:\n",
+    "            columns &= set(df.columns)\n",
+    "\n",
+    "        dfs.append(df)\n",
+    "\n",
+    "    for df in dfs:\n",
+    "        df.drop(list(set(df.columns) - columns - {target}), axis=1, inplace=True)\n",
+    "\n",
+    "    return pd.concat(dfs, axis=0)\n",
+    "\n",
+    "\n",
+    "def split_combined_dataset(df: pd.DataFrame) -> list[pd.DataFrame]:\n",
+    "    return [df[df['_dataset'] == n].drop('_dataset', axis=1) for n in sorted(df['_dataset'].unique())]"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "8e2db21a",
+   "metadata": {
+    "papermill": {
+     "duration": 0.003756,
+     "end_time": "2025-12-06T00:50:56.726339",
+     "exception": false,
+     "start_time": "2025-12-06T00:50:56.722583",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "# 4. Training"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "077296b1",
+   "metadata": {
+    "papermill": {
+     "duration": 0.003767,
+     "end_time": "2025-12-06T00:50:56.733875",
+     "exception": false,
+     "start_time": "2025-12-06T00:50:56.730108",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "## 4.1. Adversarial validation\n",
+    "Here, we want to determine whether the train and original datasets differ or are they nearly identical. To do this, we state the problem of identifying the dataset. We use the same XGB classifier and ROCAUC metrics."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "id": "abd993fc",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-12-06T00:50:56.742441Z",
+     "iopub.status.busy": "2025-12-06T00:50:56.742232Z",
+     "iopub.status.idle": "2025-12-06T00:51:01.153496Z",
+     "shell.execute_reply": "2025-12-06T00:51:01.152800Z"
+    },
+    "papermill": {
+     "duration": 4.417256,
+     "end_time": "2025-12-06T00:51:01.154881",
+     "exception": false,
+     "start_time": "2025-12-06T00:50:56.737625",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "[NUM] age has 73 unique values and 0 NANs\n",
+      "[NUM] alcohol_consumption_per_week has 11 unique values and 0 NANs\n",
+      "[NUM] physical_activity_minutes_per_week has 622 unique values and 0 NANs\n",
+      "[NUM] diet_score has 101 unique values and 0 NANs\n",
+      "[NUM] sleep_hours_per_day has 71 unique values and 0 NANs\n",
+      "[NUM] screen_time_hours_per_day has 156 unique values and 0 NANs\n",
+      "[NUM] bmi has 241 unique values and 0 NANs\n",
+      "[NUM] waist_to_hip_ratio has 40 unique values and 0 NANs\n",
+      "[NUM] systolic_bp has 86 unique values and 0 NANs\n",
+      "[NUM] diastolic_bp has 60 unique values and 0 NANs\n",
+      "[NUM] heart_rate has 64 unique values and 0 NANs\n",
+      "[NUM] cholesterol_total has 210 unique values and 0 NANs\n",
+      "[NUM] hdl_cholesterol has 79 unique values and 0 NANs\n",
+      "[NUM] ldl_cholesterol has 190 unique values and 0 NANs\n",
+      "[NUM] triglycerides has 262 unique values and 0 NANs\n",
+      "[CAT] gender has 3 unique values and 0 NANs\n",
+      "[CAT] ethnicity has 5 unique values and 0 NANs\n",
+      "[CAT] education_level has 4 unique values and 0 NANs\n",
+      "[CAT] income_level has 5 unique values and 0 NANs\n",
+      "[CAT] smoking_status has 3 unique values and 0 NANs\n",
+      "[CAT] employment_status has 4 unique values and 0 NANs\n",
+      "[NUM] family_history_diabetes has 2 unique values and 0 NANs\n",
+      "[NUM] hypertension_history has 2 unique values and 0 NANs\n",
+      "[NUM] cardiovascular_history has 2 unique values and 0 NANs\n",
+      "Categoric: ['gender', 'ethnicity', 'education_level', 'income_level', 'smoking_status', 'employment_status']\n",
+      "Numeric: ['age', 'alcohol_consumption_per_week', 'physical_activity_minutes_per_week', 'diet_score', 'sleep_hours_per_day', 'screen_time_hours_per_day', 'bmi', 'waist_to_hip_ratio', 'systolic_bp', 'diastolic_bp', 'heart_rate', 'cholesterol_total', 'hdl_cholesterol', 'ldl_cholesterol', 'triglycerides', 'family_history_diabetes', 'hypertension_history', 'cardiovascular_history']\n"
+     ]
+    }
+   ],
+   "source": [
+    "# Load the data\n",
+    "df = load_combined_dataset(CFG.train_csv, CFG.test_csv, CFG.orig_csv, target=CFG.target)\n",
+    "fe = FeatureEngineer(df, CFG.target)                                # Without FE: error\n",
+    "categoric, numeric = fe.columns_x_info()\n",
+    "fe.astype(numeric, 'int32')\n",
+    "fe.label_encoder_categoric(categoric)                               #\n",
+    "\n",
+    "df_train, df_test, df_orig = split_combined_dataset(fe.df)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 8,
+   "id": "78d7d60c",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-12-06T00:51:01.165016Z",
+     "iopub.status.busy": "2025-12-06T00:51:01.164771Z",
+     "iopub.status.idle": "2025-12-06T00:51:45.188029Z",
+     "shell.execute_reply": "2025-12-06T00:51:45.187074Z"
+    },
+    "papermill": {
+     "duration": 44.029724,
+     "end_time": "2025-12-06T00:51:45.189281",
+     "exception": false,
+     "start_time": "2025-12-06T00:51:01.159557",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "#########################\n",
+      "### Fold 1 ###\n",
+      "#########################\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/usr/local/lib/python3.11/dist-packages/xgboost/core.py:160: UserWarning: [00:51:02] WARNING: /workspace/src/learner.cc:742: \n",
+      "Parameters: { \"min_samples_split\" } are not used.\n",
+      "\n",
+      "  warnings.warn(smsg, UserWarning)\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "[0]\tvalidation_0-auc:0.54840\n",
+      "[300]\tvalidation_0-auc:0.61487\n",
+      "[600]\tvalidation_0-auc:0.61703\n",
+      "[900]\tvalidation_0-auc:0.61869\n",
+      "[999]\tvalidation_0-auc:0.61927\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/usr/local/lib/python3.11/dist-packages/xgboost/core.py:160: UserWarning: [00:51:10] WARNING: /workspace/src/common/error_msg.cc:58: Falling back to prediction using DMatrix due to mismatched devices. This might lead to higher memory usage and slower performance. XGBoost is running on: cuda:0, while the input data is on: cpu.\n",
+      "Potential solutions:\n",
+      "- Use a data structure that matches the device ordinal in the booster.\n",
+      "- Set the device for booster before call to inplace_predict.\n",
+      "\n",
+      "This warning will only be shown once.\n",
+      "\n",
+      "  warnings.warn(smsg, UserWarning)\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "#########################\n",
+      "### Fold 2 ###\n",
+      "#########################\n",
+      "[0]\tvalidation_0-auc:0.54893\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/usr/local/lib/python3.11/dist-packages/xgboost/core.py:160: UserWarning: [00:51:12] WARNING: /workspace/src/learner.cc:742: \n",
+      "Parameters: { \"min_samples_split\" } are not used.\n",
+      "\n",
+      "  warnings.warn(smsg, UserWarning)\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "[300]\tvalidation_0-auc:0.61591\n",
+      "[600]\tvalidation_0-auc:0.61766\n",
+      "[900]\tvalidation_0-auc:0.61924\n",
+      "[999]\tvalidation_0-auc:0.61983\n",
+      "#########################\n",
+      "### Fold 1 ###\n",
+      "#########################\n",
+      "[0]\tvalidation_0-auc:0.63421\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/usr/local/lib/python3.11/dist-packages/xgboost/core.py:160: UserWarning: [00:51:21] WARNING: /workspace/src/learner.cc:742: \n",
+      "Parameters: { \"min_samples_split\" } are not used.\n",
+      "\n",
+      "  warnings.warn(smsg, UserWarning)\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "[300]\tvalidation_0-auc:0.90261\n",
+      "[600]\tvalidation_0-auc:0.90733\n",
+      "[900]\tvalidation_0-auc:0.91070\n",
+      "[999]\tvalidation_0-auc:0.91151\n",
+      "#########################\n",
+      "### Fold 2 ###\n",
+      "#########################\n",
+      "[0]\tvalidation_0-auc:0.63807\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/usr/local/lib/python3.11/dist-packages/xgboost/core.py:160: UserWarning: [00:51:28] WARNING: /workspace/src/learner.cc:742: \n",
+      "Parameters: { \"min_samples_split\" } are not used.\n",
+      "\n",
+      "  warnings.warn(smsg, UserWarning)\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "[300]\tvalidation_0-auc:0.90187\n",
+      "[600]\tvalidation_0-auc:0.90657\n",
+      "[900]\tvalidation_0-auc:0.90996\n",
+      "[999]\tvalidation_0-auc:0.91086\n",
+      "#########################\n",
+      "### Fold 1 ###\n",
+      "#########################\n",
+      "[0]\tvalidation_0-auc:0.65287\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/usr/local/lib/python3.11/dist-packages/xgboost/core.py:160: UserWarning: [00:51:35] WARNING: /workspace/src/learner.cc:742: \n",
+      "Parameters: { \"min_samples_split\" } are not used.\n",
+      "\n",
+      "  warnings.warn(smsg, UserWarning)\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "[300]\tvalidation_0-auc:0.86017\n",
+      "[600]\tvalidation_0-auc:0.86548\n",
+      "[900]\tvalidation_0-auc:0.86934\n",
+      "[999]\tvalidation_0-auc:0.87029\n",
+      "#########################\n",
+      "### Fold 2 ###\n",
+      "#########################\n",
+      "[0]\tvalidation_0-auc:0.66526\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/usr/local/lib/python3.11/dist-packages/xgboost/core.py:160: UserWarning: [00:51:40] WARNING: /workspace/src/learner.cc:742: \n",
+      "Parameters: { \"min_samples_split\" } are not used.\n",
+      "\n",
+      "  warnings.warn(smsg, UserWarning)\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "[300]\tvalidation_0-auc:0.85929\n",
+      "[600]\tvalidation_0-auc:0.86497\n",
+      "[900]\tvalidation_0-auc:0.86891\n",
+      "[999]\tvalidation_0-auc:0.86984\n",
+      "\n",
+      "########################################\n",
+      "TRAIN <--> TEST oof score = 0.6195482986928571\n",
+      "TRAIN <--> ORIG oof score = 0.9111857960214286\n",
+      "TEST <--> ORIG oof score = 0.8700643765666667\n"
+     ]
+    }
+   ],
+   "source": [
+    "def adversarial_validation(df1, df2):\n",
+    "    # Below, we use simplified settings for speed since we are just testing the datasets here\n",
+    "    target = '_dataset'\n",
+    "    xgb_params = CFG.xgb_params7_optuna.copy()\n",
+    "    xgb_params['n_estimators'] = 1000\n",
+    "    k_fold_strategy = RepeatedStratifiedKFold(n_splits=2, n_repeats=1, random_state=CFG.kfold_random_state)\n",
+    "    \n",
+    "    df1 = df1.drop(CFG.target, axis=1)\n",
+    "    df2 = df2.drop(CFG.target, axis=1)    \n",
+    "    df1[target] = 1.0\n",
+    "    df2[target] = 0.0\n",
+    "    df = pd.concat((df1, df2))\n",
+    "    cv = CV(k_fold_strategy,\n",
+    "            df,\n",
+    "            target=target,\n",
+    "            proba=True)\n",
+    "    _, oof_preds = cv.fit(get_model=lambda: XGBWrapper(xgb_params), provide_val_data=True)\n",
+    "    return roc_auc_score(df[target], oof_preds)\n",
+    "    \n",
+    "oof_score_train_test = adversarial_validation(df_train, df_test)\n",
+    "oof_score_train_orig = adversarial_validation(df_train, df_orig)\n",
+    "oof_score_test_orig = adversarial_validation(df_test, df_orig)\n",
+    "\n",
+    "print('\\n' + '#' * 40)\n",
+    "\n",
+    "print(f'TRAIN <--> TEST oof score = {oof_score_train_test}')\n",
+    "print(f'TRAIN <--> ORIG oof score = {oof_score_train_orig}')\n",
+    "print(f'TEST <--> ORIG oof score = {oof_score_test_orig}')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "6c9dabb9",
+   "metadata": {
+    "papermill": {
+     "duration": 0.005844,
+     "end_time": "2025-12-06T00:51:45.201086",
+     "exception": false,
+     "start_time": "2025-12-06T00:51:45.195242",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "#### So, while TRAIN and TEST datasets have quite significant differencies, ORIGINAL dataset is completely different!\n",
+    "\n",
+    "The idea of vertical merging this dataset may be useless, so `CFG.merge_original_dataset` is set to `False`"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "08d7b171",
+   "metadata": {
+    "papermill": {
+     "duration": 0.005565,
+     "end_time": "2025-12-06T00:51:45.212316",
+     "exception": false,
+     "start_time": "2025-12-06T00:51:45.206751",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "## 4.2. Prepare the dataset"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 9,
+   "id": "d8751e80",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-12-06T00:51:45.225299Z",
+     "iopub.status.busy": "2025-12-06T00:51:45.224549Z",
+     "iopub.status.idle": "2025-12-06T00:53:48.670557Z",
+     "shell.execute_reply": "2025-12-06T00:53:48.669909Z"
+    },
+    "papermill": {
+     "duration": 123.454002,
+     "end_time": "2025-12-06T00:53:48.672059",
+     "exception": false,
+     "start_time": "2025-12-06T00:51:45.218057",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "[NUM] age has 73 unique values and 0 NANs\n",
+      "[NUM] alcohol_consumption_per_week has 11 unique values and 0 NANs\n",
+      "[NUM] physical_activity_minutes_per_week has 622 unique values and 0 NANs\n",
+      "[NUM] diet_score has 101 unique values and 0 NANs\n",
+      "[NUM] sleep_hours_per_day has 71 unique values and 0 NANs\n",
+      "[NUM] screen_time_hours_per_day has 156 unique values and 0 NANs\n",
+      "[NUM] bmi has 241 unique values and 0 NANs\n",
+      "[NUM] waist_to_hip_ratio has 40 unique values and 0 NANs\n",
+      "[NUM] systolic_bp has 86 unique values and 0 NANs\n",
+      "[NUM] diastolic_bp has 60 unique values and 0 NANs\n",
+      "[NUM] heart_rate has 64 unique values and 0 NANs\n",
+      "[NUM] cholesterol_total has 210 unique values and 0 NANs\n",
+      "[NUM] hdl_cholesterol has 79 unique values and 0 NANs\n",
+      "[NUM] ldl_cholesterol has 190 unique values and 0 NANs\n",
+      "[NUM] triglycerides has 262 unique values and 0 NANs\n",
+      "[CAT] gender has 3 unique values and 0 NANs\n",
+      "[CAT] ethnicity has 5 unique values and 0 NANs\n",
+      "[CAT] education_level has 4 unique values and 0 NANs\n",
+      "[CAT] income_level has 5 unique values and 0 NANs\n",
+      "[CAT] smoking_status has 3 unique values and 0 NANs\n",
+      "[CAT] employment_status has 4 unique values and 0 NANs\n",
+      "[NUM] family_history_diabetes has 2 unique values and 0 NANs\n",
+      "[NUM] hypertension_history has 2 unique values and 0 NANs\n",
+      "[NUM] cardiovascular_history has 2 unique values and 0 NANs\n",
+      "Categoric: ['gender', 'ethnicity', 'education_level', 'income_level', 'smoking_status', 'employment_status']\n",
+      "Numeric: ['age', 'alcohol_consumption_per_week', 'physical_activity_minutes_per_week', 'diet_score', 'sleep_hours_per_day', 'screen_time_hours_per_day', 'bmi', 'waist_to_hip_ratio', 'systolic_bp', 'diastolic_bp', 'heart_rate', 'cholesterol_total', 'hdl_cholesterol', 'ldl_cholesterol', 'triglycerides', 'family_history_diabetes', 'hypertension_history', 'cardiovascular_history']\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/tmp/ipykernel_20/3356540199.py:130: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n",
+      "  self.df[new_col] = self.df[col].round(r)\n",
+      "/tmp/ipykernel_20/3356540199.py:130: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n",
+      "  self.df[new_col] = self.df[col].round(r)\n",
+      "/tmp/ipykernel_20/3356540199.py:130: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n",
+      "  self.df[new_col] = self.df[col].round(r)\n",
+      "/tmp/ipykernel_20/3356540199.py:130: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n",
+      "  self.df[new_col] = self.df[col].round(r)\n",
+      "/tmp/ipykernel_20/3356540199.py:130: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n",
+      "  self.df[new_col] = self.df[col].round(r)\n",
+      "/tmp/ipykernel_20/3356540199.py:130: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n",
+      "  self.df[new_col] = self.df[col].round(r)\n",
+      "/tmp/ipykernel_20/3356540199.py:130: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n",
+      "  self.df[new_col] = self.df[col].round(r)\n",
+      "/tmp/ipykernel_20/3356540199.py:130: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n",
+      "  self.df[new_col] = self.df[col].round(r)\n",
+      "/tmp/ipykernel_20/3356540199.py:130: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n",
+      "  self.df[new_col] = self.df[col].round(r)\n",
+      "/tmp/ipykernel_20/3356540199.py:130: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n",
+      "  self.df[new_col] = self.df[col].round(r)\n",
+      "/tmp/ipykernel_20/3356540199.py:130: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n",
+      "  self.df[new_col] = self.df[col].round(r)\n",
+      "/tmp/ipykernel_20/3356540199.py:130: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n",
+      "  self.df[new_col] = self.df[col].round(r)\n",
+      "/tmp/ipykernel_20/3356540199.py:130: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n",
+      "  self.df[new_col] = self.df[col].round(r)\n",
+      "/tmp/ipykernel_20/3356540199.py:130: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n",
+      "  self.df[new_col] = self.df[col].round(r)\n",
+      "/tmp/ipykernel_20/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n",
+      "  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n",
+      "/tmp/ipykernel_20/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n",
+      "  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n",
+      "/tmp/ipykernel_20/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n",
+      "  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n",
+      "/tmp/ipykernel_20/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n",
+      "  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n",
+      "/tmp/ipykernel_20/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n",
+      "  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n",
+      "/tmp/ipykernel_20/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n",
+      "  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n",
+      "/tmp/ipykernel_20/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n",
+      "  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n",
+      "/tmp/ipykernel_20/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n",
+      "  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n",
+      "/tmp/ipykernel_20/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n",
+      "  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n",
+      "/tmp/ipykernel_20/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n",
+      "  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n",
+      "/tmp/ipykernel_20/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n",
+      "  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n",
+      "/tmp/ipykernel_20/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n",
+      "  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n",
+      "/tmp/ipykernel_20/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n",
+      "  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n",
+      "/tmp/ipykernel_20/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n",
+      "  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n",
+      "/tmp/ipykernel_20/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n",
+      "  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n",
+      "/tmp/ipykernel_20/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n",
+      "  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n",
+      "/tmp/ipykernel_20/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n",
+      "  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n",
+      "/tmp/ipykernel_20/3356540199.py:43: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`\n",
+      "  self.df[col + suffix] = self.df[col].factorize()[0].astype('int32')\n"
+     ]
+    }
+   ],
+   "source": [
+    "cat1, cat2 = [], []\n",
+    "\n",
+    "# Load the data\n",
+    "df = load_combined_dataset(CFG.train_csv, CFG.test_csv, CFG.orig_csv, target=CFG.target)\n",
+    "\n",
+    "# Now do different processing\n",
+    "fe = FeatureEngineer(df, CFG.target)                                # Without FE: error\n",
+    "\n",
+    "categoric, numeric = fe.columns_x_info()\n",
+    "\n",
+    "categoric += fe.add_bin_features(numeric)\n",
+    "categoric += fe.add_digit_features(numeric)\n",
+    "fe.add_round_features(numeric)\n",
+    "\n",
+    "fe.label_encoder_categoric(categoric)                               #\n",
+    "\n",
+    "cat1 = fe.label_encoder_numeric(numeric)                            #\n",
+    "fe.astype(numeric, 'int32')\n",
+    "categoric += cat1\n",
+    "\n",
+    "#combined_df = fe.create_categoric_pairs(categoric, inplace=True)    # Uncomment for experimenting\n",
+    "#cat2 = list(combined_df.columns)\n",
+    "#categoric += cat2\n",
+    "\n",
+    "fe.count_encoder_categoric(categoric)                               #\n",
+    "df_train, df_test, df_orig = split_combined_dataset(fe.df)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "bbe41008",
+   "metadata": {
+    "papermill": {
+     "duration": 0.005982,
+     "end_time": "2025-12-06T00:53:48.685239",
+     "exception": false,
+     "start_time": "2025-12-06T00:53:48.679257",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "## 4.3. Choose the k-fold strategy and on-the-fly data transform functions"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 10,
+   "id": "814441c8",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-12-06T00:53:48.698385Z",
+     "iopub.status.busy": "2025-12-06T00:53:48.697797Z",
+     "iopub.status.idle": "2025-12-06T00:53:48.703345Z",
+     "shell.execute_reply": "2025-12-06T00:53:48.702732Z"
+    },
+    "papermill": {
+     "duration": 0.01321,
+     "end_time": "2025-12-06T00:53:48.704406",
+     "exception": false,
+     "start_time": "2025-12-06T00:53:48.691196",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "k_fold_strategy = RepeatedStratifiedKFold(n_splits=CFG.kfold_n_splits, n_repeats=CFG.kfold_n_repeats, random_state=CFG.kfold_random_state)\n",
+    "\n",
+    "def fold_transform_test(df, model) -> pd.DataFrame:\n",
+    "    for col in cat1 + cat2:\n",
+    "        df[col] = model.te[col].transform(df[col].to_frame()).astype('float32')\n",
+    "    return df\n",
+    "\n",
+    "\n",
+    "def fold_transform_train(df, model) -> pd.DataFrame:\n",
+    "    if CFG.merge_original_dataset:\n",
+    "        df = pd.concat((df, df_orig), axis=0, ignore_index=True)\n",
+    "    model.te = {}\n",
+    "    for col in cat1 + cat2:\n",
+    "        #model.te[col] = TargetEncoder(target_type='continuous', smooth=1, cv=10, shuffle=True, random_state=42)\n",
+    "        model.te[col] = TargetEncoder(n_folds=10, smooth=0, split_method='random', stat='mean')\n",
+    "        df[col] = model.te[col].fit_transform(df[col].to_frame(), df[CFG.target]).astype('float32')\n",
+    "    return df"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "bc4d0f3a",
+   "metadata": {
+    "papermill": {
+     "duration": 0.006171,
+     "end_time": "2025-12-06T00:53:48.716679",
+     "exception": false,
+     "start_time": "2025-12-06T00:53:48.710508",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "## 4.4. Use optuna, if selected in configuration"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 11,
+   "id": "817d8618",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-12-06T00:53:48.729828Z",
+     "iopub.status.busy": "2025-12-06T00:53:48.729645Z",
+     "iopub.status.idle": "2025-12-06T00:53:48.739314Z",
+     "shell.execute_reply": "2025-12-06T00:53:48.738763Z"
+    },
+    "papermill": {
+     "duration": 0.017597,
+     "end_time": "2025-12-06T00:53:48.740328",
+     "exception": false,
+     "start_time": "2025-12-06T00:53:48.722731",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "def xgb_objective(trial):\n",
+    "    xgb_params = {\n",
+    "        \"objective\": \"binary:logistic\",\n",
+    "        \"eval_metric\": \"auc\",\n",
+    "        \"learning_rate\": trial.suggest_float('learning_rate', 1e-3, 1e-1, step=None, log=True),\n",
+    "        \"max_depth\": trial.suggest_int('max_depth', 0, 10, step=1, log=False),\n",
+    "        \"subsample\": trial.suggest_float('subsample', 0, 1, step=0.01, log=False),\n",
+    "        \"colsample_bytree\": trial.suggest_float('colsample_bytree', 0, 1, step=0.01, log=False),\n",
+    "        \"seed\": SEED,\n",
+    "        \"device\": \"cuda\",\n",
+    "        \"grow_policy\": \"lossguide\",\n",
+    "        \"alpha\": trial.suggest_float('alpha', 1, 10, step=0.1, log=False),\n",
+    "        \"lambda\": trial.suggest_float('lambda', 0, 1, step=0.01, log=False),\n",
+    "        \"min_child_weight\": trial.suggest_int('max_depth', 2, 10, step=1, log=False),\n",
+    "        \"min_samples_split\": trial.suggest_int('max_depth', 2, 10, step=1, log=False),\n",
+    "        \"max_bin\": 512,\n",
+    "\n",
+    "        'n_estimators': 20_000,\n",
+    "        'early_stopping_rounds': 300\n",
+    "    }\n",
+    "\n",
+    "    cv = CV(k_fold_strategy,\n",
+    "        df_train,\n",
+    "        target=CFG.target,\n",
+    "        proba=True,\n",
+    "        fold_transform_train=fold_transform_train,\n",
+    "        fold_transform_test=fold_transform_test)\n",
+    "    _, oof_preds = cv.fit(get_model=lambda: XGBWrapper(xgb_params), provide_val_data=True)\n",
+    "    oof_score = roc_auc_score(df_optuna[CFG.target], oof_preds)\n",
+    "\n",
+    "    # Log optuna's results\n",
+    "    with open('optuna_xgb.txt', 'a') as f:\n",
+    "        f.write(f'{oof_score:.6f} => {xgb_params}\\n')\n",
+    "\n",
+    "    return oof_score\n",
+    "\n",
+    "\n",
+    "def lgb_objective(trial):\n",
+    "    lgb_params = {\n",
+    "        'random_state': CFG.lgb_params['random_state'],\n",
+    "        'verbose': -1,\n",
+    "        'n_estimators': 20000,#trial.suggest_int('iterations', 10, 10_000, log=True),\n",
+    "        'metric': 'AUC',\n",
+    "        'objective': 'binary',\n",
+    "        'learning_rate': trial.suggest_float('learning_rate', 1e-4, 1, step=None, log=True),\n",
+    "        'max_depth': trial.suggest_int('max_depth', 3, 12, step=1),\n",
+    "        'min_child_samples': trial.suggest_int('min_child_samples', 10, 1000, log=True),\n",
+    "        'subsample': trial.suggest_float('subsample', 0.01, 1, step=0.01),\n",
+    "        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.01, 1, step=0.01),\n",
+    "        'num_leaves': trial.suggest_int('num_leaves', 10, 1000, log=True),\n",
+    "        'reg_alpha': trial.suggest_float('reg_alpha', 0.01, 1, step=0.01),\n",
+    "        'reg_lambda': trial.suggest_float('reg_lambda', 0.01, 10, step=0.01),\n",
+    "        'max_bin': trial.suggest_int('max_bin', 10, 255, log=True),\n",
+    "        'device': 'gpu',\n",
+    "    }\n",
+    "\n",
+    "    cv = CV(k_fold_strategy,\n",
+    "        df_optuna,\n",
+    "        target=CFG.target,\n",
+    "        proba=True,\n",
+    "        fold_transform_train=fold_transform_train,\n",
+    "        fold_transform_test=fold_transform_test)\n",
+    "    _, oof_preds = cv.fit(get_model=lambda: LGBWrapper2(lgb_params), provide_val_data=True)\n",
+    "    oof_score = roc_auc_score(df_optuna[CFG.target], oof_preds)\n",
+    "\n",
+    "    with open('optuna_lgb.txt', 'a') as f:\n",
+    "        f.write(f'{oof_score:.6f} => {lgb_params}\\n')\n",
+    "\n",
+    "    return oof_score\n",
+    "    \n",
+    "\n",
+    "if CFG.optuna:\n",
+    "    study = optuna.create_study(direction='maximize')\n",
+    "    study.optimize(xgb_objective, n_trials=200)\n",
+    "    print(study.best_params)\n",
+    "\n",
+    "    with open('best_params_xgb_optuna.pkl', 'wb') as f:\n",
+    "        pickle.dump(study.best_params, f)\n",
+    "    xgb_params = study.best_params\n",
+    "else:\n",
+    "    xgb_params = CFG.xgb_params7_optuna\n",
+    "    lgb_params = CFG.lgb_params7_optuna    "
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "0521c9d4",
+   "metadata": {
+    "papermill": {
+     "duration": 0.006125,
+     "end_time": "2025-12-06T00:53:48.752472",
+     "exception": false,
+     "start_time": "2025-12-06T00:53:48.746347",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "## 4.5. Actual training with the optimized parameters"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "326eaf7c",
+   "metadata": {
+    "papermill": {
+     "duration": 0.006,
+     "end_time": "2025-12-06T00:53:48.764543",
+     "exception": false,
+     "start_time": "2025-12-06T00:53:48.758543",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "### 4.5.1. LGB"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 12,
+   "id": "7863b7b1",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-12-06T00:53:48.777742Z",
+     "iopub.status.busy": "2025-12-06T00:53:48.777314Z",
+     "iopub.status.idle": "2025-12-06T00:53:48.781626Z",
+     "shell.execute_reply": "2025-12-06T00:53:48.781082Z"
+    },
+    "papermill": {
+     "duration": 0.011919,
+     "end_time": "2025-12-06T00:53:48.782585",
+     "exception": false,
+     "start_time": "2025-12-06T00:53:48.770666",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "def train_lgb():\n",
+    "    cv = CV(k_fold_strategy,\n",
+    "            df_train,\n",
+    "            target=CFG.target,\n",
+    "            proba=True,\n",
+    "            fold_transform_train=fold_transform_train,\n",
+    "            fold_transform_test=fold_transform_test)\n",
+    "    \n",
+    "    _, oof_preds_lgb = cv.fit(get_model=lambda: LGBWrapper(lgb_params), provide_val_data=True)\n",
+    "    oof_score_lgb = roc_auc_score(df_train[CFG.target], oof_preds_lgb)\n",
+    "    \n",
+    "    train_preds_lgb = cv.predict(df_train)\n",
+    "    train_score_lgb = roc_auc_score(df_train[CFG.target], train_preds_lgb)\n",
+    "    \n",
+    "    test_preds_lgb = cv.predict(df_test)\n",
+    "    \n",
+    "    # TRAIN score is an overfitted one, so OOF score is correct estimate, while TRAIN should be higher if everything is ok\n",
+    "    print(f'LGB: OOF score = {oof_score_lgb} / TRAIN score = {train_score_lgb}')\n",
+    "\n",
+    "    return test_preds_lgb, train_preds_lgb, oof_preds_lgb\n",
+    "\n",
+    "# LGB seems worse, so don't include it\n",
+    "#test_preds_lgb, train_preds_lgb, oof_preds_lgb = train_lgb()\n",
+    "test_preds_lgb, train_preds_lgb, oof_preds_lgb = 0, 0, 0"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "acb0dfed",
+   "metadata": {
+    "papermill": {
+     "duration": 0.00595,
+     "end_time": "2025-12-06T00:53:48.794726",
+     "exception": false,
+     "start_time": "2025-12-06T00:53:48.788776",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "### 4.5.2. XGB"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 13,
+   "id": "4bd05599",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-12-06T00:53:48.807443Z",
+     "iopub.status.busy": "2025-12-06T00:53:48.807272Z",
+     "iopub.status.idle": "2025-12-06T01:25:04.714347Z",
+     "shell.execute_reply": "2025-12-06T01:25:04.713485Z"
+    },
+    "papermill": {
+     "duration": 1875.915046,
+     "end_time": "2025-12-06T01:25:04.715796",
+     "exception": false,
+     "start_time": "2025-12-06T00:53:48.800750",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "#########################\n",
+      "### Fold 1 ###\n",
+      "#########################\n",
+      "[0]\tvalidation_0-auc:0.68162\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/usr/local/lib/python3.11/dist-packages/xgboost/core.py:160: UserWarning: [00:53:59] WARNING: /workspace/src/learner.cc:742: \n",
+      "Parameters: { \"min_samples_split\" } are not used.\n",
+      "\n",
+      "  warnings.warn(smsg, UserWarning)\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "[300]\tvalidation_0-auc:0.72004\n",
+      "[600]\tvalidation_0-auc:0.72627\n",
+      "[900]\tvalidation_0-auc:0.72914\n",
+      "[1200]\tvalidation_0-auc:0.73036\n",
+      "[1500]\tvalidation_0-auc:0.73116\n",
+      "[1800]\tvalidation_0-auc:0.73163\n",
+      "[2100]\tvalidation_0-auc:0.73196\n",
+      "[2400]\tvalidation_0-auc:0.73218\n",
+      "[2700]\tvalidation_0-auc:0.73235\n",
+      "[3000]\tvalidation_0-auc:0.73245\n",
+      "[3300]\tvalidation_0-auc:0.73253\n",
+      "[3600]\tvalidation_0-auc:0.73259\n",
+      "[3900]\tvalidation_0-auc:0.73264\n",
+      "[4200]\tvalidation_0-auc:0.73269\n",
+      "[4500]\tvalidation_0-auc:0.73272\n",
+      "[4800]\tvalidation_0-auc:0.73275\n",
+      "[5100]\tvalidation_0-auc:0.73276\n",
+      "[5400]\tvalidation_0-auc:0.73278\n",
+      "[5700]\tvalidation_0-auc:0.73277\n",
+      "[5781]\tvalidation_0-auc:0.73278\n",
+      "#########################\n",
+      "### Fold 2 ###\n",
+      "#########################\n",
+      "[0]\tvalidation_0-auc:0.67843\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/usr/local/lib/python3.11/dist-packages/xgboost/core.py:160: UserWarning: [00:56:32] WARNING: /workspace/src/learner.cc:742: \n",
+      "Parameters: { \"min_samples_split\" } are not used.\n",
+      "\n",
+      "  warnings.warn(smsg, UserWarning)\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "[300]\tvalidation_0-auc:0.71676\n",
+      "[600]\tvalidation_0-auc:0.72340\n",
+      "[900]\tvalidation_0-auc:0.72661\n",
+      "[1200]\tvalidation_0-auc:0.72800\n",
+      "[1500]\tvalidation_0-auc:0.72902\n",
+      "[1800]\tvalidation_0-auc:0.72962\n",
+      "[2100]\tvalidation_0-auc:0.72999\n",
+      "[2400]\tvalidation_0-auc:0.73024\n",
+      "[2700]\tvalidation_0-auc:0.73043\n",
+      "[3000]\tvalidation_0-auc:0.73060\n",
+      "[3300]\tvalidation_0-auc:0.73072\n",
+      "[3600]\tvalidation_0-auc:0.73081\n",
+      "[3900]\tvalidation_0-auc:0.73087\n",
+      "[4200]\tvalidation_0-auc:0.73092\n",
+      "[4500]\tvalidation_0-auc:0.73097\n",
+      "[4800]\tvalidation_0-auc:0.73100\n",
+      "[5100]\tvalidation_0-auc:0.73104\n",
+      "[5400]\tvalidation_0-auc:0.73105\n",
+      "[5700]\tvalidation_0-auc:0.73106\n",
+      "[6000]\tvalidation_0-auc:0.73107\n",
+      "[6300]\tvalidation_0-auc:0.73108\n",
+      "[6600]\tvalidation_0-auc:0.73110\n",
+      "[6900]\tvalidation_0-auc:0.73111\n",
+      "[7200]\tvalidation_0-auc:0.73111\n",
+      "[7232]\tvalidation_0-auc:0.73111\n",
+      "#########################\n",
+      "### Fold 3 ###\n",
+      "#########################\n",
+      "[0]\tvalidation_0-auc:0.68148\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/usr/local/lib/python3.11/dist-packages/xgboost/core.py:160: UserWarning: [00:59:39] WARNING: /workspace/src/learner.cc:742: \n",
+      "Parameters: { \"min_samples_split\" } are not used.\n",
+      "\n",
+      "  warnings.warn(smsg, UserWarning)\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "[300]\tvalidation_0-auc:0.71915\n",
+      "[600]\tvalidation_0-auc:0.72487\n",
+      "[900]\tvalidation_0-auc:0.72747\n",
+      "[1200]\tvalidation_0-auc:0.72856\n",
+      "[1500]\tvalidation_0-auc:0.72921\n",
+      "[1800]\tvalidation_0-auc:0.72963\n",
+      "[2100]\tvalidation_0-auc:0.72991\n",
+      "[2400]\tvalidation_0-auc:0.73008\n",
+      "[2700]\tvalidation_0-auc:0.73021\n",
+      "[3000]\tvalidation_0-auc:0.73030\n",
+      "[3300]\tvalidation_0-auc:0.73040\n",
+      "[3600]\tvalidation_0-auc:0.73046\n",
+      "[3900]\tvalidation_0-auc:0.73051\n",
+      "[4200]\tvalidation_0-auc:0.73056\n",
+      "[4500]\tvalidation_0-auc:0.73060\n",
+      "[4800]\tvalidation_0-auc:0.73063\n",
+      "[5100]\tvalidation_0-auc:0.73063\n",
+      "[5400]\tvalidation_0-auc:0.73065\n",
+      "[5700]\tvalidation_0-auc:0.73065\n",
+      "[5929]\tvalidation_0-auc:0.73066\n",
+      "#########################\n",
+      "### Fold 4 ###\n",
+      "#########################\n",
+      "[0]\tvalidation_0-auc:0.67961\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/usr/local/lib/python3.11/dist-packages/xgboost/core.py:160: UserWarning: [01:02:14] WARNING: /workspace/src/learner.cc:742: \n",
+      "Parameters: { \"min_samples_split\" } are not used.\n",
+      "\n",
+      "  warnings.warn(smsg, UserWarning)\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "[300]\tvalidation_0-auc:0.71684\n",
+      "[600]\tvalidation_0-auc:0.72308\n",
+      "[900]\tvalidation_0-auc:0.72613\n",
+      "[1200]\tvalidation_0-auc:0.72747\n",
+      "[1500]\tvalidation_0-auc:0.72839\n",
+      "[1800]\tvalidation_0-auc:0.72895\n",
+      "[2100]\tvalidation_0-auc:0.72930\n",
+      "[2400]\tvalidation_0-auc:0.72954\n",
+      "[2700]\tvalidation_0-auc:0.72971\n",
+      "[3000]\tvalidation_0-auc:0.72983\n",
+      "[3300]\tvalidation_0-auc:0.72993\n",
+      "[3600]\tvalidation_0-auc:0.73001\n",
+      "[3900]\tvalidation_0-auc:0.73008\n",
+      "[4200]\tvalidation_0-auc:0.73013\n",
+      "[4500]\tvalidation_0-auc:0.73017\n",
+      "[4800]\tvalidation_0-auc:0.73021\n",
+      "[5100]\tvalidation_0-auc:0.73024\n",
+      "[5400]\tvalidation_0-auc:0.73026\n",
+      "[5700]\tvalidation_0-auc:0.73026\n",
+      "[6000]\tvalidation_0-auc:0.73028\n",
+      "[6300]\tvalidation_0-auc:0.73030\n",
+      "[6600]\tvalidation_0-auc:0.73030\n",
+      "[6685]\tvalidation_0-auc:0.73030\n",
+      "#########################\n",
+      "### Fold 5 ###\n",
+      "#########################\n",
+      "[0]\tvalidation_0-auc:0.68272\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/usr/local/lib/python3.11/dist-packages/xgboost/core.py:160: UserWarning: [01:05:08] WARNING: /workspace/src/learner.cc:742: \n",
+      "Parameters: { \"min_samples_split\" } are not used.\n",
+      "\n",
+      "  warnings.warn(smsg, UserWarning)\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "[300]\tvalidation_0-auc:0.71973\n",
+      "[600]\tvalidation_0-auc:0.72562\n",
+      "[900]\tvalidation_0-auc:0.72844\n",
+      "[1200]\tvalidation_0-auc:0.72970\n",
+      "[1500]\tvalidation_0-auc:0.73056\n",
+      "[1800]\tvalidation_0-auc:0.73106\n",
+      "[2100]\tvalidation_0-auc:0.73141\n",
+      "[2400]\tvalidation_0-auc:0.73163\n",
+      "[2700]\tvalidation_0-auc:0.73180\n",
+      "[3000]\tvalidation_0-auc:0.73193\n",
+      "[3300]\tvalidation_0-auc:0.73201\n",
+      "[3600]\tvalidation_0-auc:0.73208\n",
+      "[3900]\tvalidation_0-auc:0.73212\n",
+      "[4200]\tvalidation_0-auc:0.73215\n",
+      "[4500]\tvalidation_0-auc:0.73220\n",
+      "[4800]\tvalidation_0-auc:0.73222\n",
+      "[5100]\tvalidation_0-auc:0.73223\n",
+      "[5214]\tvalidation_0-auc:0.73223\n",
+      "#########################\n",
+      "### Fold 6 ###\n",
+      "#########################\n",
+      "[0]\tvalidation_0-auc:0.68152\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/usr/local/lib/python3.11/dist-packages/xgboost/core.py:160: UserWarning: [01:07:29] WARNING: /workspace/src/learner.cc:742: \n",
+      "Parameters: { \"min_samples_split\" } are not used.\n",
+      "\n",
+      "  warnings.warn(smsg, UserWarning)\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "[300]\tvalidation_0-auc:0.71968\n",
+      "[600]\tvalidation_0-auc:0.72583\n",
+      "[900]\tvalidation_0-auc:0.72869\n",
+      "[1200]\tvalidation_0-auc:0.72990\n",
+      "[1500]\tvalidation_0-auc:0.73074\n",
+      "[1800]\tvalidation_0-auc:0.73119\n",
+      "[2100]\tvalidation_0-auc:0.73149\n",
+      "[2400]\tvalidation_0-auc:0.73169\n",
+      "[2700]\tvalidation_0-auc:0.73184\n",
+      "[3000]\tvalidation_0-auc:0.73196\n",
+      "[3300]\tvalidation_0-auc:0.73203\n",
+      "[3600]\tvalidation_0-auc:0.73210\n",
+      "[3900]\tvalidation_0-auc:0.73216\n",
+      "[4200]\tvalidation_0-auc:0.73221\n",
+      "[4500]\tvalidation_0-auc:0.73225\n",
+      "[4800]\tvalidation_0-auc:0.73228\n",
+      "[5100]\tvalidation_0-auc:0.73230\n",
+      "[5400]\tvalidation_0-auc:0.73231\n",
+      "[5700]\tvalidation_0-auc:0.73232\n",
+      "[6000]\tvalidation_0-auc:0.73233\n",
+      "[6300]\tvalidation_0-auc:0.73235\n",
+      "[6600]\tvalidation_0-auc:0.73235\n",
+      "[6765]\tvalidation_0-auc:0.73234\n",
+      "#########################\n",
+      "### Fold 7 ###\n",
+      "#########################\n",
+      "[0]\tvalidation_0-auc:0.67819\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/usr/local/lib/python3.11/dist-packages/xgboost/core.py:160: UserWarning: [01:10:25] WARNING: /workspace/src/learner.cc:742: \n",
+      "Parameters: { \"min_samples_split\" } are not used.\n",
+      "\n",
+      "  warnings.warn(smsg, UserWarning)\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "[300]\tvalidation_0-auc:0.71583\n",
+      "[600]\tvalidation_0-auc:0.72208\n",
+      "[900]\tvalidation_0-auc:0.72522\n",
+      "[1200]\tvalidation_0-auc:0.72656\n",
+      "[1500]\tvalidation_0-auc:0.72749\n",
+      "[1800]\tvalidation_0-auc:0.72804\n",
+      "[2100]\tvalidation_0-auc:0.72841\n",
+      "[2400]\tvalidation_0-auc:0.72865\n",
+      "[2700]\tvalidation_0-auc:0.72882\n",
+      "[3000]\tvalidation_0-auc:0.72895\n",
+      "[3300]\tvalidation_0-auc:0.72907\n",
+      "[3600]\tvalidation_0-auc:0.72915\n",
+      "[3900]\tvalidation_0-auc:0.72922\n",
+      "[4200]\tvalidation_0-auc:0.72927\n",
+      "[4500]\tvalidation_0-auc:0.72931\n",
+      "[4800]\tvalidation_0-auc:0.72933\n",
+      "[5100]\tvalidation_0-auc:0.72937\n",
+      "[5400]\tvalidation_0-auc:0.72939\n",
+      "[5700]\tvalidation_0-auc:0.72939\n",
+      "[5952]\tvalidation_0-auc:0.72939\n",
+      "#########################\n",
+      "### Fold 8 ###\n",
+      "#########################\n",
+      "[0]\tvalidation_0-auc:0.68154\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/usr/local/lib/python3.11/dist-packages/xgboost/core.py:160: UserWarning: [01:13:03] WARNING: /workspace/src/learner.cc:742: \n",
+      "Parameters: { \"min_samples_split\" } are not used.\n",
+      "\n",
+      "  warnings.warn(smsg, UserWarning)\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "[300]\tvalidation_0-auc:0.71957\n",
+      "[600]\tvalidation_0-auc:0.72539\n",
+      "[900]\tvalidation_0-auc:0.72820\n",
+      "[1200]\tvalidation_0-auc:0.72940\n",
+      "[1500]\tvalidation_0-auc:0.73021\n",
+      "[1800]\tvalidation_0-auc:0.73073\n",
+      "[2100]\tvalidation_0-auc:0.73105\n",
+      "[2400]\tvalidation_0-auc:0.73125\n",
+      "[2700]\tvalidation_0-auc:0.73137\n",
+      "[3000]\tvalidation_0-auc:0.73150\n",
+      "[3300]\tvalidation_0-auc:0.73157\n",
+      "[3600]\tvalidation_0-auc:0.73164\n",
+      "[3900]\tvalidation_0-auc:0.73168\n",
+      "[4200]\tvalidation_0-auc:0.73172\n",
+      "[4500]\tvalidation_0-auc:0.73175\n",
+      "[4800]\tvalidation_0-auc:0.73177\n",
+      "[5100]\tvalidation_0-auc:0.73178\n",
+      "[5400]\tvalidation_0-auc:0.73181\n",
+      "[5700]\tvalidation_0-auc:0.73182\n",
+      "[6000]\tvalidation_0-auc:0.73185\n",
+      "[6300]\tvalidation_0-auc:0.73184\n",
+      "[6312]\tvalidation_0-auc:0.73184\n",
+      "#########################\n",
+      "### Fold 9 ###\n",
+      "#########################\n",
+      "[0]\tvalidation_0-auc:0.68035\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/usr/local/lib/python3.11/dist-packages/xgboost/core.py:160: UserWarning: [01:15:49] WARNING: /workspace/src/learner.cc:742: \n",
+      "Parameters: { \"min_samples_split\" } are not used.\n",
+      "\n",
+      "  warnings.warn(smsg, UserWarning)\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "[300]\tvalidation_0-auc:0.71791\n",
+      "[600]\tvalidation_0-auc:0.72425\n",
+      "[900]\tvalidation_0-auc:0.72715\n",
+      "[1200]\tvalidation_0-auc:0.72843\n",
+      "[1500]\tvalidation_0-auc:0.72932\n",
+      "[1800]\tvalidation_0-auc:0.72987\n",
+      "[2100]\tvalidation_0-auc:0.73020\n",
+      "[2400]\tvalidation_0-auc:0.73044\n",
+      "[2700]\tvalidation_0-auc:0.73061\n",
+      "[3000]\tvalidation_0-auc:0.73074\n",
+      "[3300]\tvalidation_0-auc:0.73084\n",
+      "[3600]\tvalidation_0-auc:0.73093\n",
+      "[3900]\tvalidation_0-auc:0.73100\n",
+      "[4200]\tvalidation_0-auc:0.73103\n",
+      "[4500]\tvalidation_0-auc:0.73107\n",
+      "[4800]\tvalidation_0-auc:0.73109\n",
+      "[5100]\tvalidation_0-auc:0.73112\n",
+      "[5400]\tvalidation_0-auc:0.73113\n",
+      "[5700]\tvalidation_0-auc:0.73114\n",
+      "[6000]\tvalidation_0-auc:0.73115\n",
+      "[6300]\tvalidation_0-auc:0.73116\n",
+      "[6600]\tvalidation_0-auc:0.73116\n",
+      "[6794]\tvalidation_0-auc:0.73117\n",
+      "#########################\n",
+      "### Fold 10 ###\n",
+      "#########################\n",
+      "[0]\tvalidation_0-auc:0.68224\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/usr/local/lib/python3.11/dist-packages/xgboost/core.py:160: UserWarning: [01:18:45] WARNING: /workspace/src/learner.cc:742: \n",
+      "Parameters: { \"min_samples_split\" } are not used.\n",
+      "\n",
+      "  warnings.warn(smsg, UserWarning)\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "[300]\tvalidation_0-auc:0.71975\n",
+      "[600]\tvalidation_0-auc:0.72602\n",
+      "[900]\tvalidation_0-auc:0.72895\n",
+      "[1200]\tvalidation_0-auc:0.73020\n",
+      "[1500]\tvalidation_0-auc:0.73106\n",
+      "[1800]\tvalidation_0-auc:0.73158\n",
+      "[2100]\tvalidation_0-auc:0.73189\n",
+      "[2400]\tvalidation_0-auc:0.73210\n",
+      "[2700]\tvalidation_0-auc:0.73224\n",
+      "[3000]\tvalidation_0-auc:0.73234\n",
+      "[3300]\tvalidation_0-auc:0.73242\n",
+      "[3600]\tvalidation_0-auc:0.73248\n",
+      "[3900]\tvalidation_0-auc:0.73254\n",
+      "[4200]\tvalidation_0-auc:0.73257\n",
+      "[4500]\tvalidation_0-auc:0.73261\n",
+      "[4800]\tvalidation_0-auc:0.73264\n",
+      "[5100]\tvalidation_0-auc:0.73264\n",
+      "[5400]\tvalidation_0-auc:0.73265\n",
+      "[5700]\tvalidation_0-auc:0.73266\n",
+      "[6000]\tvalidation_0-auc:0.73266\n",
+      "[6300]\tvalidation_0-auc:0.73268\n",
+      "[6600]\tvalidation_0-auc:0.73269\n",
+      "[6866]\tvalidation_0-auc:0.73267\n",
+      "XGB: OOF score = 0.7317538366708274 / TRAIN score = 0.7460631139393147\n"
+     ]
+    }
+   ],
+   "source": [
+    "def train_xgb():\n",
+    "    cv = CV(k_fold_strategy,\n",
+    "            df_train,\n",
+    "            target=CFG.target,\n",
+    "            proba=True,\n",
+    "            fold_transform_train=fold_transform_train,\n",
+    "            fold_transform_test=fold_transform_test)\n",
+    "    \n",
+    "    _, oof_preds_xgb = cv.fit(get_model=lambda: XGBWrapper(xgb_params), provide_val_data=True)\n",
+    "    oof_score_xgb = roc_auc_score(df_train[CFG.target], oof_preds_xgb)\n",
+    "    \n",
+    "    train_preds_xgb = cv.predict(df_train)\n",
+    "    train_score_xgb = roc_auc_score(df_train[CFG.target], train_preds_xgb)\n",
+    "    \n",
+    "    test_preds_xgb = cv.predict(df_test)\n",
+    "    \n",
+    "    # TRAIN score is an overfitted one, so OOF score is correct estimate, while TRAIN should be higher if everything is ok\n",
+    "    print(f'XGB: OOF score = {oof_score_xgb} / TRAIN score = {train_score_xgb}')\n",
+    "\n",
+    "    return test_preds_xgb, train_preds_xgb, oof_preds_xgb\n",
+    "\n",
+    "test_preds_xgb, train_preds_xgb, oof_preds_xgb = train_xgb()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "4ca1b1b5",
+   "metadata": {
+    "papermill": {
+     "duration": 0.016095,
+     "end_time": "2025-12-06T01:25:04.747432",
+     "exception": false,
+     "start_time": "2025-12-06T01:25:04.731337",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "### 4.5.3 Combine the predictions of two classifiers"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 14,
+   "id": "ac6312da",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-12-06T01:25:04.778190Z",
+     "iopub.status.busy": "2025-12-06T01:25:04.777943Z",
+     "iopub.status.idle": "2025-12-06T01:25:05.100017Z",
+     "shell.execute_reply": "2025-12-06T01:25:05.099184Z"
+    },
+    "papermill": {
+     "duration": 0.339062,
+     "end_time": "2025-12-06T01:25:05.101334",
+     "exception": false,
+     "start_time": "2025-12-06T01:25:04.762272",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "XGB: OOF score = 0.7317538366708274 / TRAIN score = 0.7460631139393147\n"
+     ]
+    }
+   ],
+   "source": [
+    "test_preds = 0.5 * test_preds_xgb + 0.5 * test_preds_lgb\n",
+    "oof_preds = 0.5 * oof_preds_xgb + 0.5 * oof_preds_lgb\n",
+    "train_preds = 0.5 * train_preds_xgb + 0.5 * train_preds_lgb\n",
+    "\n",
+    "oof_score = roc_auc_score(df_train[CFG.target], oof_preds)\n",
+    "train_score = roc_auc_score(df_train[CFG.target], train_preds)\n",
+    "\n",
+    "# TRAIN score is an overfitted one, so OOF score is correct estimate, while TRAIN should be higher if everything is ok\n",
+    "print(f'XGB: OOF score = {oof_score} / TRAIN score = {train_score}')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "543bce29",
+   "metadata": {
+    "papermill": {
+     "duration": 0.014805,
+     "end_time": "2025-12-06T01:25:05.131503",
+     "exception": false,
+     "start_time": "2025-12-06T01:25:05.116698",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "source": [
+    "# 5. Submit the results"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 15,
+   "id": "5c86fe34",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-12-06T01:25:05.162048Z",
+     "iopub.status.busy": "2025-12-06T01:25:05.161821Z",
+     "iopub.status.idle": "2025-12-06T01:25:05.742097Z",
+     "shell.execute_reply": "2025-12-06T01:25:05.741413Z"
+    },
+    "papermill": {
+     "duration": 0.597054,
+     "end_time": "2025-12-06T01:25:05.743288",
+     "exception": false,
+     "start_time": "2025-12-06T01:25:05.146234",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<div>\n",
+       "<style scoped>\n",
+       "    .dataframe tbody tr th:only-of-type {\n",
+       "        vertical-align: middle;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe tbody tr th {\n",
+       "        vertical-align: top;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe thead th {\n",
+       "        text-align: right;\n",
+       "    }\n",
+       "</style>\n",
+       "<table border=\"1\" class=\"dataframe\">\n",
+       "  <thead>\n",
+       "    <tr style=\"text-align: right;\">\n",
+       "      <th></th>\n",
+       "      <th>id</th>\n",
+       "      <th>diagnosed_diabetes</th>\n",
+       "    </tr>\n",
+       "  </thead>\n",
+       "  <tbody>\n",
+       "    <tr>\n",
+       "      <th>0</th>\n",
+       "      <td>700000</td>\n",
+       "      <td>0.236527</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1</th>\n",
+       "      <td>700001</td>\n",
+       "      <td>0.368034</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>2</th>\n",
+       "      <td>700002</td>\n",
+       "      <td>0.394842</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>3</th>\n",
+       "      <td>700003</td>\n",
+       "      <td>0.187408</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>4</th>\n",
+       "      <td>700004</td>\n",
+       "      <td>0.469889</td>\n",
+       "    </tr>\n",
+       "  </tbody>\n",
+       "</table>\n",
+       "</div>"
+      ],
+      "text/plain": [
+       "       id  diagnosed_diabetes\n",
+       "0  700000            0.236527\n",
+       "1  700001            0.368034\n",
+       "2  700002            0.394842\n",
+       "3  700003            0.187408\n",
+       "4  700004            0.469889"
+      ]
+     },
+     "execution_count": 15,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "# Save the results\n",
+    "fname = 'submission.csv'\n",
+    "submission = pd.read_csv(CFG.sample_submission_csv)\n",
+    "submission[CFG.target] = test_preds\n",
+    "submission.to_csv(fname, index=False)\n",
+    "submission.head()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "538751f5",
+   "metadata": {
+    "papermill": {
+     "duration": 0.015478,
+     "end_time": "2025-12-06T01:25:05.774517",
+     "exception": false,
+     "start_time": "2025-12-06T01:25:05.759039",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": []
+  }
+ ],
+ "metadata": {
+  "kaggle": {
+   "accelerator": "nvidiaTeslaT4",
+   "dataSources": [
+    {
+     "databundleVersionId": 14272474,
+     "sourceId": 91723,
+     "sourceType": "competition"
+    },
+    {
+     "datasetId": 8316713,
+     "sourceId": 13128284,
+     "sourceType": "datasetVersion"
+    }
+   ],
+   "dockerImageVersionId": 31193,
+   "isGpuEnabled": true,
+   "isInternetEnabled": true,
+   "language": "python",
+   "sourceType": "notebook"
+  },
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.11.13"
+  },
+  "papermill": {
+   "default_parameters": {},
+   "duration": 2067.710484,
+   "end_time": "2025-12-06T01:25:08.354343",
+   "environment_variables": {},
+   "exception": null,
+   "input_path": "__notebook__.ipynb",
+   "output_path": "__notebook__.ipynb",
+   "parameters": {},
+   "start_time": "2025-12-06T00:50:40.643859",
+   "version": "2.6.0"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
